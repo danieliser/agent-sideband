@@ -1,0 +1,69 @@
+{
+  "name": "agent-sideband",
+  "version": "0.1.0",
+  "description": "A host-independent coordination sideband for teams of coding agents.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Daniel Iser",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danieliser/agent-sideband.git"
+  },
+  "bugs": {
+    "url": "https://github.com/danieliser/agent-sideband/issues"
+  },
+  "homepage": "https://github.com/danieliser/agent-sideband#readme",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "pnpm@11.10.0",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./t3": {
+      "types": "./dist/adapters/t3.d.ts",
+      "import": "./dist/adapters/t3.js"
+    }
+  },
+  "bin": {
+    "agent-sideband": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "migrations",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build",
+    "dev": "tsx src/cli.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "prepare": "pnpm run build",
+    "start": "node dist/cli.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "better-sqlite3": "12.10.0",
+    "fastify": "5.12.5",
+    "pino": "9.14.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.36.0",
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "22.18.6",
+    "eslint": "9.36.0",
+    "prettier": "3.6.2",
+    "tsx": "4.20.6",
+    "typescript": "5.9.2",
+    "typescript-eslint": "8.44.1",
+    "vitest": "5.0.1"
+  }
+}
