@@ -173,4 +173,91 @@ describe("Agent Sideband HTTP API", () => {
         .find((event) => event.type === "message.claimed"),
     ).toEqual(expect.objectContaining({ actorPrincipalId: "lead-principal" }));
   });
+
+  it("derives self-service claim and acknowledgement identity from the credential", async () => {
+    const { app, store } = setup();
+    store.registerAgent({ agentId: "lead" });
+    store.registerAgent({ agentId: "sender" });
+    const message = store.sendMessage({
+      idempotencyKey: "self-service-send",
+      fromAgentId: "sender",
+      target: { type: "agent", id: "lead" },
+      correlationId: "self-service-work",
+      body: "Handle this without accepting a caller-supplied identity.",
+      messageClass: "request",
+      provenance: {
+        authenticatedPrincipalId: "sender-principal",
+        source: "http",
+        sourceInstanceId: "api-test",
+        sourceOperationId: "self-service-send",
+        trust: "untrusted",
+      },
+    });
+    const headers = { authorization: `Bearer ${token}` };
+
+    const claimed = await app.inject({
+      method: "POST",
+      url: `/v1/inbox/${message.messageId}/claim`,
+      headers,
+      payload: { consumerId: "lead-worker", leaseSeconds: 30, recipientAgentId: "sender" },
+    });
+    expect(claimed.statusCode).toBe(200);
+    expect(claimed.json()).toEqual(
+      expect.objectContaining({ recipientAgentId: "lead", status: "claimed" }),
+    );
+
+    const acknowledged = await app.inject({
+      method: "POST",
+      url: `/v1/inbox/${message.messageId}/ack`,
+      headers,
+      payload: {
+        claimToken: claimed.json().claimToken,
+        receiptId: "self-service-receipt",
+        recipientAgentId: "sender",
+      },
+    });
+    expect(acknowledged.statusCode).toBe(200);
+    expect(acknowledged.json()).toEqual(
+      expect.objectContaining({ recipientAgentId: "lead", status: "delivered" }),
+    );
+  });
+
+  it("derives self-service release identity from the credential", async () => {
+    const { app, store } = setup();
+    store.registerAgent({ agentId: "lead" });
+    store.registerAgent({ agentId: "sender" });
+    const message = store.sendMessage({
+      idempotencyKey: "self-service-release-send",
+      fromAgentId: "sender",
+      target: { type: "agent", id: "lead" },
+      correlationId: "self-service-release-work",
+      body: "Release this claim.",
+      messageClass: "request",
+      provenance: {
+        authenticatedPrincipalId: "sender-principal",
+        source: "http",
+        sourceInstanceId: "api-test",
+        sourceOperationId: "self-service-release-send",
+        trust: "untrusted",
+      },
+    });
+    const headers = { authorization: `Bearer ${token}` };
+    const claimed = await app.inject({
+      method: "POST",
+      url: `/v1/inbox/${message.messageId}/claim`,
+      headers,
+      payload: { consumerId: "lead-worker", leaseSeconds: 30 },
+    });
+    const released = await app.inject({
+      method: "POST",
+      url: `/v1/inbox/${message.messageId}/release`,
+      headers,
+      payload: { claimToken: claimed.json().claimToken, recipientAgentId: "sender" },
+    });
+
+    expect(released.statusCode).toBe(200);
+    expect(released.json()).toEqual(
+      expect.objectContaining({ recipientAgentId: "lead", status: "pending" }),
+    );
+  });
 });

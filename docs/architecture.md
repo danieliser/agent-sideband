@@ -4,9 +4,9 @@ Agent Sideband is a modular monolith with a durable core and optional host
 adapters.
 
 ```text
-Clients and wrappers
+Clients and hosts
+  ├── standalone MCP server
   ├── T3 Code adapter
-  ├── PERSIST wrapper
   └── other agent hosts
           │
           ▼
@@ -16,7 +16,7 @@ Agent Sideband API
   ├── claim leases and acknowledgements
   ├── presence and bindings
   ├── spawn, deliver, interrupt, and stop commands
-  └── durable replayable event log (polling in 0.1)
+  └── durable replayable event log (polling in 0.2)
           │
           ▼
         SQLite
@@ -48,9 +48,9 @@ adapters must preserve the authenticated source separately from the body.
 ## Events
 
 Every state mutation appends a monotonically sequenced durable event in the
-same SQLite transaction. Version 0.1 exposes bounded cursor-based replay and a
+same SQLite transaction. Version 0.2 exposes bounded cursor-based replay and a
 durable head over HTTP polling. A stored-then-live SSE publisher is planned but
 is not part of the current release.
 
-Version 0.1 has one idempotent bootstrap migration. Future schema changes must
+Version 0.2 has one idempotent bootstrap migration. Future schema changes must
 add a versioned migration ledger rather than mutating that bootstrap in place.

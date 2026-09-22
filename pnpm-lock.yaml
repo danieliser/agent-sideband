@@ -7,6 +7,9 @@ settings:
 importers:
   .:
     dependencies:
+      "@modelcontextprotocol/server":
+        specifier: 2.0.0
+        version: 2.0.0
       better-sqlite3:
         specifier: 12.10.0
         version: 12.10.0
@@ -16,10 +19,16 @@ importers:
       pino:
         specifier: 9.14.0
         version: 9.14.0
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
     devDependencies:
       "@eslint/js":
         specifier: 9.36.0
         version: 9.36.0
+      "@modelcontextprotocol/client":
+        specifier: 2.0.0
+        version: 2.0.0
       "@types/better-sqlite3":
         specifier: 7.6.13
         version: 7.6.13
@@ -668,6 +677,27 @@ packages:
       {
         integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==,
       }
+
+  "@modelcontextprotocol/client@2.0.0":
+    resolution:
+      {
+        integrity: sha512-8f1OghQ2rjzIOfqgUCP+8GiUWqRs89njoWLNqAe8kWmDePv3s1fZXseej+QXemssEuuOvLLmLO/kqM3IQHtISw==,
+      }
+    engines: { node: ">=20" }
+
+  "@modelcontextprotocol/core@2.0.0":
+    resolution:
+      {
+        integrity: sha512-pJCEwGG7Lfr/+PQp9ZTwKXNeO5wzbfKL7H3MYpCorM4oFBoQrdjnBgEoqG+RjhsvS1FKrDbKux+M1HhlnGWqcA==,
+      }
+    engines: { node: ">=20" }
+
+  "@modelcontextprotocol/server@2.0.0":
+    resolution:
+      {
+        integrity: sha512-YhHWdHfpFMQfd0prsEnxKeS3Qz3ytIGmsS0sth4KDjnacIT7hxk6hXHkJ9KysxlkvTM+WZAtQbbcUhdoP4Hvtw==,
+      }
+    engines: { node: ">=20" }
 
   "@napi-rs/lzma-linux-x64-gnu@1.5.1":
     resolution:
@@ -1415,6 +1445,20 @@ packages:
       }
     engines: { node: ">=0.10.0" }
 
+  eventsource-parser@3.1.1:
+    resolution:
+      {
+        integrity: sha512-EKN1vKAMcZ8MlYMpaNuxN6R9yakzH6uajHcHVTqWJzvu5pWw9DyhbP35HH8MVBQ+dZjAfDxk+A8NiR9KWaXiyQ==,
+      }
+    engines: { node: ">=18.0.0" }
+
+  eventsource@3.0.7:
+    resolution:
+      {
+        integrity: sha512-CRT1WTyuQoD771GW56XEZFQ/ZoSfWid1alKGDYMmkt2yl8UXrVR4pspqWNEcqKvVIzg6PAltWjxcSSPrboA4iA==,
+      }
+    engines: { node: ">=18.0.0" }
+
   expand-template@2.0.3:
     resolution:
       {
@@ -1695,6 +1739,12 @@ packages:
         integrity: sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw==,
       }
 
+  jose@6.2.12:
+    resolution:
+      {
+        integrity: sha512-9NiFmJEex0sy2Dk58j2UGBSHgUs2ypF9eZSu4L6vjOX3Dp96Sw1F3uL+H+D1sx02jZZdzUT0HgvCy59CuvXcWw==,
+      }
+
   js-yaml@4.3.2:
     resolution:
       {
@@ -1949,6 +1999,13 @@ packages:
         integrity: sha512-8OEwKp5juEvb/MjpIc4hjqfgCNysrS94RIOMXYvpYCdm/jglrKEiAYmiumbmGhCvs+IcInsphYDFwqrjr7398w==,
       }
     hasBin: true
+
+  pkce-challenge@5.0.1:
+    resolution:
+      {
+        integrity: sha512-wQ0b/W4Fr01qtpHlqSqspcj3EhBvimsdh0KlHhH8HRZnMsEa0ea2fTULOXOS9ccQr3om+GcGRk4e+isrZWV8qQ==,
+      }
+    engines: { node: ">=16.20.0" }
 
   postcss@8.5.28:
     resolution:
@@ -2467,6 +2524,12 @@ packages:
       }
     engines: { node: ">=10" }
 
+  zod@4.6.5:
+    resolution:
+      {
+        integrity: sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==,
+      }
+
 snapshots:
   "@esbuild/aix-ppc64@0.25.12":
     optional: true
@@ -2715,6 +2778,25 @@ snapshots:
     dependencies:
       "@jridgewell/resolve-uri": 3.1.2
       "@jridgewell/sourcemap-codec": 1.6.0
+
+  "@modelcontextprotocol/client@2.0.0":
+    dependencies:
+      "@modelcontextprotocol/core": 2.0.0
+      cross-spawn: 7.0.6
+      eventsource: 3.0.7
+      eventsource-parser: 3.1.1
+      jose: 6.2.12
+      pkce-challenge: 5.0.1
+      zod: 4.6.5
+
+  "@modelcontextprotocol/core@2.0.0":
+    dependencies:
+      zod: 4.6.5
+
+  "@modelcontextprotocol/server@2.0.0":
+    dependencies:
+      "@modelcontextprotocol/core": 2.0.0
+      zod: 4.6.5
 
   "@napi-rs/lzma-linux-x64-gnu@1.5.1":
     optional: true
@@ -3189,6 +3271,12 @@ snapshots:
 
   esutils@2.0.3: {}
 
+  eventsource-parser@3.1.1: {}
+
+  eventsource@3.0.7:
+    dependencies:
+      eventsource-parser: 3.1.1
+
   expand-template@2.0.3: {}
 
   expect-type@1.4.0: {}
@@ -3334,6 +3422,8 @@ snapshots:
 
   isexe@2.0.0: {}
 
+  jose@6.2.12: {}
+
   js-yaml@4.3.2:
     dependencies:
       argparse: 2.0.1
@@ -3466,6 +3556,8 @@ snapshots:
       safe-stable-stringify: 2.5.0
       sonic-boom: 4.2.1
       thread-stream: 3.2.0
+
+  pkce-challenge@5.0.1: {}
 
   postcss@8.5.28:
     dependencies:
@@ -3746,3 +3838,5 @@ snapshots:
   wrappy@1.0.2: {}
 
   yocto-queue@0.1.0: {}
+
+  zod@4.6.5: {}

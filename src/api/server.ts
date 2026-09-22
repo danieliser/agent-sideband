@@ -320,6 +320,51 @@ export function buildAgentSidebandServer(options: AgentSidebandServerOptions): F
     },
   );
 
+  app.post<{ Params: { messageId: string } }>("/v1/inbox/:messageId/claim", async (request) => {
+    const principal = requirePrincipal(request, "messages:read");
+    if (principal.agentId === null) {
+      throw new SidebandError("UNAUTHORIZED", "Credential is not bound to an agent.");
+    }
+    const body = objectBody(request);
+    return options.store.claimMessage({
+      messageId: request.params.messageId,
+      recipientAgentId: principal.agentId,
+      consumerId: stringValue(body.consumerId, "consumerId"),
+      leaseSeconds: numberValue(body.leaseSeconds, "leaseSeconds"),
+      actorPrincipalId: principal.principalId,
+    });
+  });
+
+  app.post<{ Params: { messageId: string } }>("/v1/inbox/:messageId/ack", async (request) => {
+    const principal = requirePrincipal(request, "messages:read");
+    if (principal.agentId === null) {
+      throw new SidebandError("UNAUTHORIZED", "Credential is not bound to an agent.");
+    }
+    const body = objectBody(request);
+    const receiptId = optionalString(body.receiptId, "receiptId");
+    return options.store.acknowledgeMessage({
+      messageId: request.params.messageId,
+      recipientAgentId: principal.agentId,
+      claimToken: stringValue(body.claimToken, "claimToken"),
+      ...(receiptId === undefined ? {} : { receiptId }),
+      actorPrincipalId: principal.principalId,
+    });
+  });
+
+  app.post<{ Params: { messageId: string } }>("/v1/inbox/:messageId/release", async (request) => {
+    const principal = requirePrincipal(request, "messages:read");
+    if (principal.agentId === null) {
+      throw new SidebandError("UNAUTHORIZED", "Credential is not bound to an agent.");
+    }
+    const body = objectBody(request);
+    return options.store.releaseMessage({
+      messageId: request.params.messageId,
+      recipientAgentId: principal.agentId,
+      claimToken: stringValue(body.claimToken, "claimToken"),
+      actorPrincipalId: principal.principalId,
+    });
+  });
+
   app.post<{ Params: { messageId: string } }>("/v1/messages/:messageId/claim", async (request) => {
     const body = objectBody(request);
     const recipientAgentId = stringValue(body.recipientAgentId, "recipientAgentId");

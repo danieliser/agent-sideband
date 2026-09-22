@@ -39,3 +39,12 @@ export type {
 export type * from "./core/types.js";
 export { SqliteSidebandStore } from "./store/sqlite.js";
 export type { SidebandStore } from "./store/store.js";
+export { SidebandApiError, SidebandHttpClient } from "./mcp/http-client.js";
+export type {
+  SidebandApiErrorCode,
+  SidebandHttpClientOptions,
+  SidebandMcpApiClient,
+  SidebandMcpRequestOptions,
+} from "./mcp/http-client.js";
+export { buildAgentSidebandMcpServer } from "./mcp/server.js";
+export type { AgentSidebandMcpServerOptions } from "./mcp/server.js";

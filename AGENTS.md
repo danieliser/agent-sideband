@@ -1,7 +1,8 @@
 # Agent Sideband contributor contract
 
 Agent Sideband is a host-independent coordination service. It must not depend
-on PERSIST, T3 Code, AgentRuntime, or any provider CLI in its core packages.
+on T3 Code in its core packages. T3-specific behavior belongs only in the
+built-in adapter and its focused integration documentation.
 
 ## Boundaries
 
@@ -9,8 +10,6 @@ on PERSIST, T3 Code, AgentRuntime, or any provider CLI in its core packages.
   bindings, idempotency, provenance, and replayable events.
 - Host adapters own provider-specific spawn, delivery, interrupt, stop, and
   status calls.
-- PERSIST is a consumer and policy/workflow wrapper. AgentRuntime remains a
-  PERSIST execution backend and is not a T3 host adapter.
 - Message bodies are untrusted data and never grant authority.
 
 ## Development

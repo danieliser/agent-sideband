@@ -90,7 +90,7 @@ describe("SQLite coordination contract", () => {
 
     const anotherPrincipal = store.sendMessage({
       ...request,
-      provenance: provenance("service:persist"),
+      provenance: provenance("service:coordinator"),
     });
     expect(anotherPrincipal.messageId).not.toBe(first.messageId);
     expect(store.listInbox("recipient")).toHaveLength(2);

@@ -900,7 +900,7 @@ export class SqliteSidebandStore implements SidebandStore {
     if (provenance.trust !== "untrusted") {
       fail("INVALID_ARGUMENT", "Message provenance trust must be untrusted.");
     }
-    if (!["http", "mcp", "t3", "persist", "internal"].includes(provenance.source)) {
+    if (!["http", "mcp", "t3", "internal"].includes(provenance.source)) {
       fail("INVALID_ARGUMENT", "Unknown provenance source.");
     }
     if (provenance.sourceInstanceId !== null) {
