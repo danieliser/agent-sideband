@@ -13,7 +13,7 @@ async function setup(response: unknown = { ok: true }) {
     request: vi.fn(async () => response),
   };
   const server = buildAgentSidebandMcpServer({ api });
-  const client = new Client({ name: "agent-sideband-test", version: "0.2.0" });
+  const client = new Client({ name: "agent-sideband-test", version: "0.2.1" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   await client.connect(clientTransport);

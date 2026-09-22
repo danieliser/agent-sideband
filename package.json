@@ -1,6 +1,6 @@
 {
   "name": "agent-sideband",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A host-independent coordination sideband for teams of coding agents.",
   "type": "module",
   "license": "MIT",

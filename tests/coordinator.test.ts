@@ -67,7 +67,7 @@ describe("Agent Sideband host coordination", () => {
       adapter: "test-host",
       parentAgentId: null,
       prompt: "Review the change.",
-      provider: "codex",
+      provider: "provider-1",
       metadata: { projectId: "project-1" },
     } as const;
 
@@ -115,7 +115,7 @@ describe("Agent Sideband host coordination", () => {
       adapter: "test-host",
       parentAgentId: null,
       prompt: "Start exactly once.",
-      provider: "codex",
+      provider: "provider-1",
       metadata: {},
     } as const;
 
@@ -313,7 +313,7 @@ describe("Agent Sideband host coordination", () => {
       adapter: "test-host",
       parentAgentId: null,
       prompt: "Start.",
-      provider: "claude",
+      provider: "provider-1",
       metadata: {},
     } as const;
 

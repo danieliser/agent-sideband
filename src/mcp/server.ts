@@ -53,7 +53,7 @@ async function call(api: SidebandMcpApiClient, path: string, options?: SidebandM
 }
 
 export function buildAgentSidebandMcpServer(options: AgentSidebandMcpServerOptions): McpServer {
-  const server = new McpServer({ name: "agent-sideband", version: "0.2.0" });
+  const server = new McpServer({ name: "agent-sideband", version: "0.2.1" });
 
   server.registerTool(
     "sideband_agents_list",

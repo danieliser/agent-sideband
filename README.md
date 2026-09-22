@@ -119,7 +119,7 @@ curl -X POST http://127.0.0.1:7341/v1/agents/reviewer/spawn \
   -H 'Content-Type: application/json' \
   -d '{
     "adapter":"t3",
-    "provider":"codex",
+    "provider":"replace-with-provider-instance-id",
     "prompt":"Review the current change and report risks.",
     "metadata":{
       "projectId":"replace-with-project-id",
