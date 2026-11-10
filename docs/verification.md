@@ -1,3 +1,35 @@
+# Verification
+
+## Version 0.3.0 release candidate — 2026-11-10
+
+The complete standalone check (format, lint, TypeScript, tests, build) passed
+with 381 tests across 25 files under Node 25.9.0. Focused regression coverage
+includes impossible cron calendars without multi-second timezone scans,
+distant dates, fractional/extreme offsets, and the existing DST gap/fold cases.
+Remote-review regressions cover interval overflow and exhausted cursors, queued
+send recovery, missing adapters, blocked event intake and principal-ID limits.
+
+The release tarball was installed in an isolated npm consumer, including its
+native SQLite dependency. Package modules, the stdio MCP transport, versioned
+migrations 1–4, schedule normalization and persisted due time were exercised.
+The shipped daemon executable was stopped and restarted before a four-second
+reminder became due; its default timer materialized one occurrence with
+`TARGET_UNBOUND`, as expected without a host adapter. This proves automatic
+packaged scheduling and database retention, not a model wake or consumption.
+CI repeats package installation and this qualification on Node 22, 24 and 26.
+
+Default T3 spawning and explicit managed spawning are tested separately with
+host responses. Stock mode immediately records the receipt-based binding;
+managed mode requires enrollment and is not enabled by the CLI. No native T3
+feature, T3 migration or production host change is part of this release.
+
+The prior live messaging run below is historical evidence for two real model
+sessions. It is not fresh model qualification of every new feature. No
+cross-provider soak, unattended T3 restart recovery, or model consumption of a
+silent context note is claimed.
+
+## Historical verification
+
 # Standalone verification
 
 ## Live two-agent check: passed
@@ -37,11 +69,11 @@ matched the dependency build resolved that local setup problem.
 
 ## What this does not prove
 
-- **Built-in scheduling:** there is no scheduler in Sideband. The test harness
+- **Built-in scheduling:** the tested 0.2 revision had no built-in scheduler. The test harness
   owned the timer and resumed the host session. It did not invoke a Sideband
   host-wake operation or test a durable schedule surviving a restart.
 - **Automatic identity provisioning:** the test supplied a custom library
-  authenticator. The packaged daemon still exposes one `operator` identity;
+  authenticator. That tested revision exposed one `operator` identity;
   sharing that token between agents does not create distinct identities.
 - **A complete T3 team workflow:** this run did not use T3, spawn agents through
   the T3 adapter, or exercise T3-managed MCP credential provisioning. See

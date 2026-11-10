@@ -26,7 +26,7 @@ Agent Sideband API
 
 Agent Sideband owns coordination state. A host continues to own its native
 project, thread, provider process, terminal, browser, and workspace state. A
-workflow system continues to own tasks, plans, approvals, budgets, schedules,
+workflow system continues to own tasks, plans, approvals, budgets, business schedules,
 and business policy.
 
 The core records external host IDs as bindings; it never treats a projection
@@ -52,5 +52,7 @@ same SQLite transaction. Version 0.2 exposes bounded cursor-based replay and a
 durable head over HTTP polling. A stored-then-live SSE publisher is planned but
 is not part of the current release.
 
-Version 0.2 has one idempotent bootstrap migration. Future schema changes must
-add a versioned migration ledger rather than mutating that bootstrap in place.
+The composed daemon applies four additive migrations on a checksummed version
+ledger: core coordination, schedules, identity and managed spawn intents. Sideband
+reminders are delivery primitives; workflow engines retain business scheduling
+and orchestration policy.
