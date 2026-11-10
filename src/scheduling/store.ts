@@ -535,7 +535,7 @@ export class SqliteScheduleStore {
       const matches = this.database
         .prepare(
           `SELECT schedule_id FROM schedules
-           WHERE owner_principal_id = ? AND trigger_type = 'event' AND status = 'active'
+           WHERE owner_principal_id = ? AND trigger_type = 'event' AND status IN ('active', 'blocked')
              AND json_extract(trigger_json, '$.eventName') = ?
            ORDER BY schedule_id`,
         )

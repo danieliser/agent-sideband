@@ -371,6 +371,15 @@ describe("managed spawn: intent before host I/O", () => {
 });
 
 describe("managed spawn: authority", () => {
+  it("refuses an unprovisionable principal before host I/O", async () => {
+    const w = world();
+    await expectRejects(
+      w.sideband.spawnAgent(spawnInput(w, { agentId: "a".repeat(123) })),
+      "INVALID_ARGUMENT",
+    );
+    expect(w.host.spawn).not.toHaveBeenCalled();
+    expect(intents(w)).toHaveLength(0);
+  });
   it("refuses a missing, forged or mismatched spawner before any write or host I/O", async () => {
     const w = world();
     const attempts: Array<[Partial<SpawnAgentInput>, string]> = [

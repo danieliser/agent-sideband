@@ -12,6 +12,8 @@
   identity requires explicit library opt-in and an enrolling host.
 - Avoid multi-second cron searches for impossible calendar dates while
   retaining exact timezone evaluation on matching days.
+- Recover queued sends and adapter outages without dropping reminders or named events.
+- Reject overflowing intervals and oversized identity aliases before unsafe effects.
 - Qualify installed tarballs, stdio MCP and the daemon's automatic timer in CI.
 
 The standalone MCP server is pull-only. Unattended wake needs a bound host

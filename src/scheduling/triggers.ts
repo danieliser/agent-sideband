@@ -307,11 +307,18 @@ export function normalizeTrigger(
     }
     case "interval": {
       const everySeconds = positiveSafeInteger(trigger.everySeconds, "everySeconds");
+      const everyMs = everySeconds * 1000;
+      if (!Number.isSafeInteger(everyMs) || everyMs > MAX_DUE_MS) {
+        invalid("everySeconds overflows the supported time range.");
+      }
       const anchorMs =
         trigger.startAt === undefined
           ? nowMs + everySeconds * 1000
           : parseRfc3339(trigger.startAt, "startAt");
       if (anchorMs > MAX_DUE_MS) invalid("startAt is outside the supported range.");
+      if (anchorMs + everyMs > MAX_DUE_MS) {
+        invalid("everySeconds exceeds the remaining supported time range.");
+      }
       return {
         trigger: { type: "interval", everySeconds, startAt: toIso(anchorMs) },
         firstDueMs: anchorMs,
@@ -341,8 +348,10 @@ export function nextSlotAfter(trigger: NormalizedTrigger, afterMs: number): numb
   if (trigger.type === "interval") {
     const anchor = parseRfc3339(trigger.startAt, "startAt");
     const everyMs = trigger.everySeconds * 1000;
+    if (!Number.isSafeInteger(everyMs) || everyMs <= 0 || everyMs > MAX_DUE_MS) return null;
     if (afterMs < anchor) return anchor;
-    return anchor + (Math.floor((afterMs - anchor) / everyMs) + 1) * everyMs;
+    const next = anchor + (Math.floor((afterMs - anchor) / everyMs) + 1) * everyMs;
+    return Number.isFinite(next) && next <= MAX_DUE_MS ? next : null;
   }
   if (trigger.type === "cron") {
     return nextCronMatch(parseCron(trigger.expression), trigger.timezone, afterMs);

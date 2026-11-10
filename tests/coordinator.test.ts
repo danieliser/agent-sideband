@@ -193,6 +193,19 @@ describe("Agent Sideband host coordination", () => {
     const host = adapter();
     const sideband = new AgentSideband({ store, adapters: [host] });
 
+    // Crash seam: the send committed, but dispatch was never acquired.
+    store.beginOperation({
+      principalId: "service:t3",
+      idempotencyKey: "notify-1",
+      kind: "send",
+      adapter: binding.adapter,
+      agentId: binding.agentId,
+      bindingId: binding.bindingId,
+      messageId: message.messageId,
+      correlationId: message.correlationId,
+      request: { bindingId: binding.bindingId, messageId: message.messageId, mode: "wake" },
+    });
+
     const result = await sideband.sendMessageToHost({
       principalId: "service:t3",
       idempotencyKey: "notify-1",

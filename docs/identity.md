@@ -162,7 +162,9 @@ agent-sideband connector enroll --adapter t3 --host-instance my-laptop --allow-a
 ```
 
 The connector can then pass `requestedAgentId: "reviewer"` when registering.
-An alias can belong to only one host thread, and agents can never pick their
+Agent aliases are limited to 122 characters so their derived principal IDs fit
+the shared 128-character identifier limit. Oversized aliases are refused before
+identity persistence or managed host dispatch. An alias can belong to only one host thread, and agents can never pick their
 own identity.
 
 ## Spawns Sideband starts

@@ -1476,6 +1476,8 @@ export class IdentityService {
         return denySpawn("The intended agent already has an identity.");
       }
     }
+    // Refuse an identity that could not enroll before any host spawn is dispatched.
+    principalIdForAgent(request.intendedAgentId);
     const target = this.principalByAgent(request.intendedAgentId);
     if (target && target.access_state !== "active") {
       return denySpawn("Access for the intended agent was revoked.");

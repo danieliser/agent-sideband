@@ -536,7 +536,7 @@ export class AgentSideband {
       kind: "send",
       request,
     });
-    if (replayed !== null) {
+    if (replayed !== null && replayed.stage !== "queued") {
       if (input.replayIndeterminate && replayed.stage === "indeterminate") {
         return this.replayIndeterminate(replayed, input.mode);
       }

@@ -389,6 +389,10 @@ export class Scheduler<TCaller = unknown> {
           // Unknown failure before any recorded effect: leave the lease to expire and retry.
           continue;
         }
+        if (error.code === "ADAPTER_NOT_FOUND") {
+          results.push(this.finish(claim, this.blocked(claim, error.code, error.message)));
+          continue;
+        }
         outcome = {
           state: "failed",
           operationId: null,

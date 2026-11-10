@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { SidebandError } from "../core/errors.js";
 
 /** Hash a tuple with length-prefixed fields so field boundaries cannot be forged. */
 export function framedHash(fields: readonly string[]): string {
@@ -35,6 +36,12 @@ export function deriveConnectorId(adapter: string, hostInstanceId: string): stri
 }
 
 export function principalIdForAgent(agentId: string): string {
+  if (agentId.length + "agent:".length > 128) {
+    throw new SidebandError(
+      "INVALID_ARGUMENT",
+      "Agent aliases must fit the 122-character principal limit.",
+    );
+  }
   return `agent:${agentId}`;
 }
 

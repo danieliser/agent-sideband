@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { nextCronMatch, normalizeTrigger, parseCron } from "../src/scheduling/triggers.js";
+import {
+  nextSlotAfter,
+  nextCronMatch,
+  normalizeTrigger,
+  parseCron,
+} from "../src/scheduling/triggers.js";
 
 describe("cron calendar search", () => {
   it("rejects impossible dates without formatting millions of timezone minutes", () => {
@@ -30,4 +35,21 @@ describe("cron calendar search", () => {
     );
     expect(new Date(result!).toISOString()).toBe(expected);
   });
+});
+
+it("rejects overflowing interval steps and safely exhausts existing cursors", () => {
+  const startAt = "2026-11-10T00:00:00.000Z";
+  expect(() =>
+    normalizeTrigger(
+      { type: "interval", everySeconds: Number.MAX_SAFE_INTEGER, startAt },
+      Date.parse(startAt),
+    ),
+  ).toThrow("everySeconds");
+  expect(
+    nextSlotAfter(
+      { type: "interval", everySeconds: Number.MAX_SAFE_INTEGER, startAt },
+      Date.parse(startAt),
+    ),
+  ).toBeNull();
+  expect(nextSlotAfter({ type: "interval", everySeconds: 1, startAt }, 8.64e15)).toBeNull();
 });

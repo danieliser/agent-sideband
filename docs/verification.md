@@ -3,9 +3,11 @@
 ## Version 0.3.0 release candidate — 2026-11-10
 
 The complete standalone check (format, lint, TypeScript, tests, build) passed
-with 373 tests across 25 files under Node 25.9.0. Focused regression coverage
+with 381 tests across 25 files under Node 25.9.0. Focused regression coverage
 includes impossible cron calendars without multi-second timezone scans,
 distant dates, fractional/extreme offsets, and the existing DST gap/fold cases.
+Remote-review regressions cover interval overflow and exhausted cursors, queued
+send recovery, missing adapters, blocked event intake and principal-ID limits.
 
 The release tarball was installed in an isolated npm consumer, including its
 native SQLite dependency. Package modules, the stdio MCP transport, versioned

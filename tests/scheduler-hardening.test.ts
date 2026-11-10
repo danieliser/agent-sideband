@@ -147,11 +147,12 @@ function setup() {
   let schedules!: SqliteScheduleStore;
   let scheduler!: Scheduler<Caller>;
   let sideband!: AgentSideband;
+  let adapterAvailable = true;
   const boot = () => {
     store = SqliteSidebandStore.open(path, { now });
     handles.push(store);
     schedules = SqliteScheduleStore.attach(store, { now });
-    sideband = new AgentSideband({ store, adapters: [host.adapter] });
+    sideband = new AgentSideband({ store, adapters: adapterAvailable ? [host.adapter] : [] });
     scheduler = new Scheduler<Caller>({
       store,
       sideband,
@@ -210,7 +211,8 @@ function setup() {
       clock.current = new Date(clock.current.getTime() + ms);
     },
     nowIso: () => clock.current.toISOString(),
-    restart() {
+    restart(available = true) {
+      adapterAvailable = available;
       store.close();
       boot();
     },
@@ -744,5 +746,63 @@ describe("migration ledger", () => {
     expect(() => SqliteSidebandStore.open(path)).toThrowError(
       expect.objectContaining({ code: "MIGRATION_CONFLICT" }),
     );
+  });
+});
+
+describe("remote review recovery regressions", () => {
+  it("retries a due reminder after its adapter is restored", async () => {
+    const h = setup();
+    await h.scheduler.createSchedule(input());
+    h.restart(false);
+    h.advance(60_000);
+    expect((await h.scheduler.runDue())[0]?.state).toBe("blocked");
+    h.advance(6_000);
+    h.restart();
+    expect((await h.scheduler.runDue())[0]?.state).toBe("host_accepted");
+    expect(h.host.executed).toHaveLength(1);
+  });
+
+  it("retains new named events while an earlier occurrence is blocked", async () => {
+    const h = setup();
+    await h.scheduler.createSchedule(
+      input({
+        caller: { agentId: "parent", admin: true },
+        trigger: { type: "event", eventName: "build.done" },
+      }),
+    );
+    h.policy.dispatch = () => ({ allowed: false, reason: "target_offline", retryable: true });
+    const emit = (eventId: string) =>
+      h.scheduler.emitEvent({
+        principalId: "principal-parent",
+        eventId,
+        eventName: "build.done",
+        occurredAt: h.nowIso(),
+        payload: {},
+      });
+    expect(emit("first").matchedCount).toBe(1);
+    expect((await h.scheduler.runDue())[0]?.state).toBe("blocked");
+    expect(emit("second").matchedCount).toBe(1);
+    h.policy.dispatch = () => ALLOW;
+    h.advance(6_000);
+    await h.scheduler.runDue();
+    expect(h.host.executed).toHaveLength(2);
+  });
+
+  it("does not let a legacy overflowing interval poison the due batch", async () => {
+    const h = setup();
+    const bad = await h.scheduler.createSchedule(
+      input({ trigger: { type: "interval", everySeconds: 60, startAt: START } }),
+    );
+    h.store.database
+      .prepare("UPDATE schedules SET trigger_json = ? WHERE schedule_id = ?")
+      .run(
+        JSON.stringify({ type: "interval", everySeconds: Number.MAX_SAFE_INTEGER, startAt: START }),
+        bad.schedule.scheduleId,
+      );
+    await h.scheduler.createSchedule(
+      input({ idempotencyKey: "healthy", trigger: { type: "at", at: START } }),
+    );
+    expect(await h.scheduler.runDue()).toHaveLength(2);
+    expect(h.host.executed).toHaveLength(2);
   });
 });

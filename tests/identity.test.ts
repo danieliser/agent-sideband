@@ -666,3 +666,25 @@ describe("host session lifecycle", () => {
     expect(h.identity.resolveBearer(restored.token)).not.toBeNull();
   });
 });
+
+it.each([122, 123, 128])(
+  "validates derived principal length before persisting alias %i",
+  (length) => {
+    const h = harness();
+    const alias = "a".repeat(length);
+    const connector = h.enroll(ADAPTER, "alias-host", [alias]);
+    const before = dumpDatabase(h.store.database);
+    const issue = () =>
+      provision(
+        h,
+        { hostInstanceId: "alias-host", requestedAgentId: alias },
+        "alias-test",
+        connector,
+      );
+    if (length <= 122) expect(issue().principalId).toHaveLength(128);
+    else {
+      expectCode(issue, "INVALID_ARGUMENT");
+      expect(dumpDatabase(h.store.database)).toBe(before);
+    }
+  },
+);
