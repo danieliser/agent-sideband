@@ -4,7 +4,7 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 export interface SidebandMcpRequestOptions {
-  readonly method?: "GET" | "POST";
+  readonly method?: "GET" | "POST" | "PUT";
   readonly body?: Readonly<Record<string, unknown>>;
   readonly idempotencyKey?: string;
 }
@@ -23,15 +23,30 @@ export type SidebandApiErrorCode =
   | "SIDEBAND_HTTP_ERROR"
   | "SIDEBAND_INVALID_RESPONSE";
 
+export interface SidebandApiErrorOptions {
+  readonly status?: number;
+  /** Structured code returned by the daemon, such as FORBIDDEN or SCHEDULE_NOT_FOUND. */
+  readonly remoteCode?: string;
+  readonly details?: Readonly<Record<string, unknown>>;
+  readonly retryable?: boolean;
+}
+
 export class SidebandApiError extends Error {
   readonly code: SidebandApiErrorCode;
   readonly status?: number;
+  readonly remoteCode?: string;
+  readonly details: Readonly<Record<string, unknown>>;
+  readonly retryable: boolean;
 
-  constructor(code: SidebandApiErrorCode, message: string, options: { status?: number } = {}) {
+  constructor(code: SidebandApiErrorCode, message: string, options: SidebandApiErrorOptions = {}) {
     super(message);
     this.name = "SidebandApiError";
     this.code = code;
     if (options.status !== undefined) this.status = options.status;
+    if (options.remoteCode !== undefined) this.remoteCode = options.remoteCode;
+    this.details = options.details ?? {};
+    this.retryable =
+      options.retryable ?? (code === "SIDEBAND_TIMEOUT" || code === "SIDEBAND_NETWORK_ERROR");
   }
 }
 
@@ -181,18 +196,30 @@ async function readBoundedBody(response: Response, signal: AbortSignal): Promise
   }
 }
 
-function responseError(value: unknown, status: number): SidebandApiError {
+/** Converts a daemon error body into the structured error every MCP host reports. */
+export function responseError(value: unknown, status: number): SidebandApiError {
+  const fallback = `Agent Sideband returned HTTP ${status}.`;
   if (typeof value === "object" && value !== null && "error" in value) {
     const error = (value as { error?: unknown }).error;
     if (typeof error === "object" && error !== null) {
-      const message = (error as { message?: unknown }).message;
-      if (typeof message === "string" && message.length > 0) {
-        return new SidebandApiError("SIDEBAND_HTTP_ERROR", message, { status });
-      }
+      const { code, message, details, retryable } = error as Record<string, unknown>;
+      return new SidebandApiError(
+        "SIDEBAND_HTTP_ERROR",
+        typeof message === "string" && message.length > 0 ? message : fallback,
+        {
+          status,
+          ...(typeof code === "string" && code.length > 0 ? { remoteCode: code } : {}),
+          ...(details !== null && typeof details === "object" && !Array.isArray(details)
+            ? { details: details as Record<string, unknown> }
+            : {}),
+          retryable: typeof retryable === "boolean" ? retryable : status >= 500,
+        },
+      );
     }
   }
-  return new SidebandApiError("SIDEBAND_HTTP_ERROR", `Agent Sideband returned HTTP ${status}.`, {
+  return new SidebandApiError("SIDEBAND_HTTP_ERROR", fallback, {
     status,
+    retryable: status >= 500,
   });
 }
 

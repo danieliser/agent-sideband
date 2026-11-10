@@ -4,6 +4,7 @@ import type { HostAdapter } from "../src/core/host-adapter.js";
 import { AgentSideband } from "../src/core/sideband.js";
 import type { MessageProvenance } from "../src/core/types.js";
 import { SqliteSidebandStore } from "../src/store/sqlite.js";
+import { T3HostAdapter } from "../src/adapters/t3.js";
 
 function adapter(): HostAdapter {
   return {
@@ -419,5 +420,106 @@ describe("Agent Sideband host coordination", () => {
       }),
     );
     store.close();
+  });
+
+  it("persists the exact T3 request before I/O and replays only those bytes after an ambiguous send", async () => {
+    let clock = "2026-10-08T12:00:00.000Z";
+    const json = (body: unknown) =>
+      Promise.resolve(
+        new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } }),
+      );
+    const bodiesAtDispatch: string[] = [];
+    const store = SqliteSidebandStore.open(":memory:", { now: () => clock });
+    let dispatches = 0;
+    const fetchMock = vi.fn<typeof fetch>(async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/.well-known/t3/environment") {
+        return json({
+          environmentId: "environment-1",
+          label: "Local T3",
+          platform: {},
+          serverVersion: "test",
+          capabilities: {},
+        });
+      }
+      if (path.startsWith("/api/orchestration/threads/")) {
+        return json({
+          snapshotSequence: 1,
+          thread: {
+            id: "thread-a",
+            runtimeMode: "auto",
+            interactionMode: "default",
+            session: null,
+          },
+        });
+      }
+      // The prepared row must already be durable when the mutation reaches the host.
+      expect(store.getPreparedRequest(lastOperationId(), "wake")).not.toBeNull();
+      bodiesAtDispatch.push(String(init?.body));
+      dispatches += 1;
+      if (dispatches === 1) throw new TypeError("socket hang up after write");
+      return json({ sequence: 9 });
+    });
+    const lastOperationId = () =>
+      (
+        store.database
+          .prepare("SELECT operation_id FROM operations ORDER BY created_at DESC LIMIT 1")
+          .get() as { operation_id: string }
+      ).operation_id;
+    const t3 = new T3HostAdapter({
+      baseUrl: "http://127.0.0.1:3773",
+      token: "t3-token",
+      fetch: fetchMock,
+      now: () => clock,
+    });
+    const sideband = new AgentSideband({ store, adapters: [t3] });
+    store.registerAgent({ agentId: "a" });
+    store.bindAgent({
+      bindingId: "binding-a",
+      agentId: "a",
+      adapter: "t3",
+      hostInstanceId: "environment-1",
+      externalId: "thread-a",
+      state: "idle",
+      actorPrincipalId: "operator",
+    });
+    const message = store.sendMessage({
+      idempotencyKey: "m1",
+      fromAgentId: "a",
+      target: { type: "agent", id: "a" },
+      correlationId: "c1",
+      body: "Wake up.",
+      messageClass: "request",
+      provenance: provenance(),
+    });
+    const send = {
+      principalId: "principal-a",
+      idempotencyKey: "wake-1",
+      bindingId: "binding-a",
+      messageId: message.messageId,
+      mode: "wake" as const,
+    };
+
+    const first = await sideband.sendMessageToHost(send);
+    expect(first.operation).toMatchObject({
+      stage: "indeterminate",
+      errorCode: "T3_NETWORK_ERROR",
+    });
+    expect((await sideband.sendMessageToHost(send)).operation.stage).toBe("indeterminate");
+    expect(dispatches).toBe(1);
+
+    clock = "2026-10-08T13:00:00.000Z";
+    const replayed = await sideband.sendMessageToHost({ ...send, replayIndeterminate: true });
+    expect(replayed.operation).toMatchObject({
+      operationId: first.operation.operationId,
+      stage: "accepted",
+      hostReceiptId: "t3:environment-1:sequence:9",
+    });
+    expect(bodiesAtDispatch).toHaveLength(2);
+    expect(bodiesAtDispatch[1]).toBe(bodiesAtDispatch[0]);
+    expect(JSON.parse(bodiesAtDispatch[0]!)).toMatchObject({
+      createdAt: "2026-10-08T12:00:00.000Z",
+    });
+    expect(bodiesAtDispatch[0]).not.toContain("t3-token");
   });
 });

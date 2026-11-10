@@ -602,4 +602,325 @@ describe("T3HostAdapter", () => {
     expect(String(error)).not.toContain(TOKEN);
     expect(JSON.stringify(error)).not.toContain(TOKEN);
   });
+
+  describe("operation-scoped, frozen host requests", () => {
+    const threadResponse = (runtimeMode = "full-access", interactionMode = "default") =>
+      jsonResponse({
+        snapshotSequence: 60,
+        thread: { id: "thread-1", runtimeMode, interactionMode, session: null },
+      });
+    const sendRequest = (operationId: string, idempotencyKey = "shared-caller-key") => ({
+      idempotencyKey,
+      operationId,
+      binding: binding(),
+      messageId: "message-1",
+      fromAgentId: "lead",
+      correlationId: "task-1",
+      body: "Continue.",
+      messageClass: "request" as const,
+      metadata: {},
+      leg: "wake" as const,
+    });
+
+    it("derives command and message IDs from the operation, never the caller key", async () => {
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(environmentResponse())
+        .mockResolvedValueOnce(threadResponse())
+        .mockResolvedValueOnce(threadResponse())
+        .mockResolvedValueOnce(threadResponse());
+      const adapter = makeAdapter(fetchMock);
+      const first = await adapter.prepare(sendRequest("operation-a"));
+      const collidingKey = await adapter.prepare(sendRequest("operation-b"));
+      const sameOperation = await adapter.prepare(sendRequest("operation-a", "another-key"));
+      if ("stage" in first || "stage" in collidingKey || "stage" in sameOperation) {
+        throw new Error("expected prepared requests");
+      }
+      expect(first.replaySafe).toBe(true);
+      expect(first.payload.commandId).not.toBe(collidingKey.payload.commandId);
+      expect((first.payload.message as { messageId: string }).messageId).not.toBe(
+        (collidingKey.payload.message as { messageId: string }).messageId,
+      );
+      expect(sameOperation.payload.commandId).toBe(first.payload.commandId);
+      expect(JSON.stringify(first)).not.toContain(TOKEN);
+    });
+
+    it("executes the stored payload byte-for-byte even after thread modes and the clock change", async () => {
+      let clock = NOW;
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(environmentResponse())
+        .mockResolvedValueOnce(threadResponse("full-access", "plan"))
+        .mockResolvedValueOnce(jsonResponse({ sequence: 61 }))
+        .mockResolvedValueOnce(jsonResponse({ sequence: 61 }));
+      const adapter = makeAdapter(fetchMock, { now: () => clock });
+      const prepared = await adapter.prepare(sendRequest("operation-frozen"));
+      if ("stage" in prepared) throw new Error("expected prepared request");
+      clock = "2026-09-21T11:00:00.000Z";
+      const stored = JSON.parse(JSON.stringify(prepared)) as typeof prepared;
+      const first = await adapter.execute({
+        operationId: "operation-frozen",
+        binding: binding(),
+        prepared: stored,
+      });
+      const replay = await adapter.execute({
+        operationId: "operation-frozen",
+        binding: binding(),
+        prepared: stored,
+      });
+      expect(first).toMatchObject({ stage: "accepted", receiptId: "t3:environment-1:sequence:61" });
+      expect(replay).toMatchObject({
+        stage: "accepted",
+        receiptId: "t3:environment-1:sequence:61",
+      });
+      const bodies = fetchMock.mock.calls.slice(2).map(([, init]) => String(init?.body));
+      expect(bodies[0]).toBe(bodies[1]);
+      expect(JSON.parse(bodies[0]!)).toMatchObject({
+        createdAt: NOW,
+        interactionMode: "plan",
+        commandId: prepared.payload.commandId,
+      });
+    });
+
+    it("refuses to retarget a stored request to another thread", async () => {
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(environmentResponse())
+        .mockResolvedValueOnce(threadResponse());
+      const adapter = makeAdapter(fetchMock);
+      const prepared = await adapter.prepare(sendRequest("operation-pinned"));
+      if ("stage" in prepared) throw new Error("expected prepared request");
+      await expect(
+        adapter.execute({
+          operationId: "operation-pinned",
+          binding: binding({ externalId: "thread-2" }),
+          prepared,
+        }),
+      ).resolves.toMatchObject({ stage: "failed", errorCode: "T3_BINDING_MISMATCH" });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("reports an unreachable host during prepare as a retryable no-effect failure", async () => {
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(environmentResponse())
+        .mockRejectedValueOnce(new Error("ECONNREFUSED"));
+      const adapter = makeAdapter(fetchMock);
+      await expect(adapter.prepare(sendRequest("operation-down"))).resolves.toEqual({
+        stage: "failed",
+        receiptId: null,
+        errorCode: "T3_NETWORK_ERROR",
+        errorMessage: "T3 request failed before a response.",
+        retryable: true,
+      });
+      await expect(
+        adapter.prepare({ ...sendRequest("operation-context"), leg: "context" }),
+      ).resolves.toMatchObject({
+        stage: "failed",
+        errorCode: "T3_CONTEXT_UNSUPPORTED",
+        retryable: false,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("derives spawn thread and command IDs from the operation ID", async () => {
+      const spawnRequest = (operationId: string) => ({
+        idempotencyKey: "same-key",
+        operationId,
+        agentId: "reviewer",
+        parentAgentId: null,
+        prompt: "Review.",
+        provider: "provider-work",
+        metadata: { projectId: "project-1", model: "model-1" },
+      });
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(environmentResponse())
+        .mockImplementation(() => Promise.resolve(jsonResponse({ sequence: 70 })));
+      const adapter = makeAdapter(fetchMock);
+      const first = await adapter.spawn(spawnRequest("operation-spawn-a"));
+      const second = await adapter.spawn(spawnRequest("operation-spawn-b"));
+      if (first.stage !== "accepted" || second.stage !== "accepted") {
+        throw new Error("expected accepted spawns");
+      }
+      expect(first.externalId).not.toBe(second.externalId);
+      expect(first.detail?.threadCreateCommandId).not.toBe(second.detail?.threadCreateCommandId);
+    });
+  });
+
+  describe("managed spawn plan", () => {
+    const planRequest = (operationId: string, metadata: Record<string, unknown> = {}) => ({
+      operationId,
+      agentId: "reviewer",
+      provider: "provider-work",
+      metadata: { projectId: "project-1", model: "model-1", ...metadata },
+    });
+    const spawnRequest = (
+      operationId: string,
+      plan: { hostInstanceId: string; externalId: string } | undefined,
+      metadata: Record<string, unknown> = {},
+    ) => ({
+      idempotencyKey: "managed-key",
+      operationId,
+      agentId: "reviewer",
+      parentAgentId: null,
+      prompt: "Review.",
+      provider: "provider-work",
+      metadata: { projectId: "project-1", model: "model-1", ...metadata },
+      ...(plan === undefined ? {} : { plan }),
+    });
+    const dispatched = (fetchMock: ReturnType<typeof vi.fn<typeof fetch>>) =>
+      fetchMock.mock.calls
+        .filter(([, init]) => init?.method === "POST")
+        .map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>);
+
+    it("reserves the thread id the legacy spawn would have generated, from the trusted environment", async () => {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(environmentResponse());
+      const adapter = makeAdapter(fetchMock);
+      expect(adapter.reservedSpawnMetadata).toEqual(["threadId"]);
+
+      const plan = await adapter.planSpawn(planRequest("operation-plan-1"));
+      expect(plan).toEqual({
+        hostInstanceId: "environment-1",
+        externalId: expect.stringMatching(/^sideband-[0-9a-f]{32}$/),
+      });
+      // Deterministic for an operation, distinct across operations.
+      await expect(adapter.planSpawn(planRequest("operation-plan-1"))).resolves.toEqual(plan);
+      const other = await adapter.planSpawn(planRequest("operation-plan-2"));
+      expect(other.externalId).not.toBe(plan.externalId);
+
+      // Planning is read-only: only the environment descriptor was fetched.
+      expect(dispatched(fetchMock)).toEqual([]);
+      expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+        "http://127.0.0.1:3773/.well-known/t3/environment",
+      ]);
+
+      // The same id an unmanaged spawn of that operation would have created.
+      const legacyFetch = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(environmentResponse())
+        .mockImplementation(() => Promise.resolve(jsonResponse({ sequence: 1 })));
+      const legacy = await makeAdapter(legacyFetch).spawn(
+        spawnRequest("operation-plan-1", undefined),
+      );
+      expect(legacy).toMatchObject({ externalId: plan.externalId });
+    });
+
+    it("ignores caller-supplied tuple data and refuses a caller-chosen thread id when planning", async () => {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(environmentResponse());
+      const adapter = makeAdapter(fetchMock);
+      const clean = await adapter.planSpawn(planRequest("operation-plan-1"));
+      await expect(
+        adapter.planSpawn(planRequest("operation-plan-1", { threadId: "someone-elses-thread" })),
+      ).rejects.toMatchObject({ code: "T3_INVALID_REQUEST" });
+      await expect(
+        adapter.planSpawn(
+          planRequest("operation-plan-1", { hostInstanceId: "evil-env", externalId: "evil" }),
+        ),
+      ).resolves.toEqual(clean);
+      await expect(adapter.planSpawn(planRequest(" "))).rejects.toMatchObject({
+        code: "T3_INVALID_REQUEST",
+      });
+    });
+
+    it("does not plan when the environment cannot be read", async () => {
+      const fetchMock = vi.fn<typeof fetch>().mockRejectedValue(new Error("ECONNREFUSED"));
+      await expect(
+        makeAdapter(fetchMock).planSpawn(planRequest("operation-plan-1")),
+      ).rejects.toMatchObject({ code: "T3_NETWORK_ERROR" });
+      expect(dispatched(fetchMock)).toEqual([]);
+    });
+
+    it("creates exactly the planned thread and reports exactly the planned tuple", async () => {
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(environmentResponse())
+        .mockImplementation(() => Promise.resolve(jsonResponse({ sequence: 9 })));
+      const adapter = makeAdapter(fetchMock);
+      const plan = await adapter.planSpawn(planRequest("operation-plan-1"));
+
+      const receipt = await adapter.spawn(spawnRequest("operation-plan-1", plan));
+
+      expect(receipt).toMatchObject({
+        stage: "accepted",
+        externalId: plan.externalId,
+        hostInstanceId: plan.hostInstanceId,
+      });
+      const commands = dispatched(fetchMock);
+      expect(commands.map((command) => command.type)).toEqual([
+        "thread.create",
+        "thread.turn.start",
+      ]);
+      expect(commands.map((command) => command.threadId)).toEqual([
+        plan.externalId,
+        plan.externalId,
+      ]);
+    });
+
+    it("refuses a caller-chosen thread id on a planned spawn before any mutation", async () => {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(environmentResponse());
+      const adapter = makeAdapter(fetchMock);
+      const plan = await adapter.planSpawn(planRequest("operation-plan-1"));
+
+      for (const threadId of ["someone-elses-thread", plan.externalId]) {
+        const receipt = await adapter.spawn(spawnRequest("operation-plan-1", plan, { threadId }));
+        expect(receipt).toMatchObject({ stage: "failed", errorCode: "T3_INVALID_REQUEST" });
+        expect(receipt).not.toHaveProperty("externalId");
+      }
+      expect(dispatched(fetchMock)).toEqual([]);
+    });
+
+    it("refuses a plan that is not this operation's tuple in this environment before any mutation", async () => {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(environmentResponse());
+      const adapter = makeAdapter(fetchMock);
+      const plan = await adapter.planSpawn(planRequest("operation-plan-1"));
+      const otherOperation = await adapter.planSpawn(planRequest("operation-plan-2"));
+
+      const forged = [
+        { ...plan, externalId: "someone-elses-thread" },
+        { ...plan, hostInstanceId: "environment-2" },
+        otherOperation,
+        { hostInstanceId: plan.hostInstanceId, externalId: "" },
+      ];
+      for (const candidate of forged) {
+        const receipt = await adapter.spawn(spawnRequest("operation-plan-1", candidate));
+        expect(receipt).toMatchObject({ stage: "failed", errorCode: "T3_INVALID_REQUEST" });
+        expect(receipt).not.toHaveProperty("externalId");
+      }
+      expect(dispatched(fetchMock)).toEqual([]);
+    });
+
+    it("keeps a planned partial spawn pending on the planned tuple", async () => {
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(environmentResponse())
+        .mockResolvedValueOnce(jsonResponse({ sequence: 50 }))
+        .mockResolvedValueOnce(new Response("nope", { status: 500 }));
+      const adapter = makeAdapter(fetchMock);
+      const plan = await adapter.planSpawn(planRequest("operation-plan-1"));
+
+      const receipt = await adapter.spawn(spawnRequest("operation-plan-1", plan));
+
+      expect(receipt).toMatchObject({
+        stage: "indeterminate",
+        errorCode: "T3_PARTIAL_SPAWN",
+        detail: { externalId: plan.externalId, hostInstanceId: plan.hostInstanceId },
+      });
+    });
+
+    it("preserves unmanaged behavior: a caller-chosen thread id still works without a plan", async () => {
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(environmentResponse())
+        .mockImplementation(() => Promise.resolve(jsonResponse({ sequence: 3 })));
+      const receipt = await makeAdapter(fetchMock).spawn(
+        spawnRequest("operation-legacy", undefined, { threadId: "chosen-thread" }),
+      );
+      expect(receipt).toMatchObject({ stage: "accepted", externalId: "chosen-thread" });
+      expect(dispatched(fetchMock).map((command) => command.threadId)).toEqual([
+        "chosen-thread",
+        "chosen-thread",
+      ]);
+    });
+  });
 });

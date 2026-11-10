@@ -1,4 +1,8 @@
-import type { HostOperationReceipt } from "../core/host-adapter.js";
+import type {
+  HostDeliveryLeg,
+  HostOperationReceipt,
+  HostPreparedRequest,
+} from "../core/host-adapter.js";
 import type {
   AgentBinding,
   AgentRecord,
@@ -75,6 +79,30 @@ export interface RecordOperationReceiptInput {
   readonly operationId: string;
   readonly receipt: HostOperationReceipt;
   readonly binding?: BindAgentInput;
+  /**
+   * Attaches an already existing binding (for example the one identity enrollment created) to the
+   * operation instead of creating a new one. It must belong to the operation's agent. Exclusive
+   * with `binding`.
+   */
+  readonly bindingId?: string;
+}
+
+/** The host tuple a raw bind would write. */
+export interface RawBindTarget {
+  readonly agentId: string;
+  readonly adapter: string;
+  readonly hostInstanceId: string;
+  readonly externalId: string;
+}
+
+/** A prepared host request as persisted before I/O, with its leg receipt once known. */
+export interface StoredHostRequest {
+  readonly operationId: string;
+  readonly adapter: string;
+  readonly bindingId: string;
+  readonly requestHash: string;
+  readonly prepared: HostPreparedRequest;
+  readonly receipt: HostOperationReceipt | null;
 }
 
 export interface SidebandStore {
@@ -149,7 +177,15 @@ export interface SidebandStore {
   }): DeliveryRecord;
   getDelivery(messageId: string, recipientAgentId: string): DeliveryRecord;
 
+  /**
+   * Raw bind. Refused (BINDING_CONFLICT) for any host tuple that identity enrollment manages or a
+   * spawn intent reserves: those bind only through identity provisioning.
+   */
   bindAgent(input: BindAgentInput): AgentBinding;
+  /** Throws BINDING_CONFLICT exactly when bindAgent would refuse this tuple. No writes. */
+  assertRawBindAllowed(target: RawBindTarget): void;
+  /** Runs fn in one immediate transaction that joins an open one. A throw rolls everything back. */
+  inTransaction<T>(fn: () => T): T;
   getBinding(bindingId: string): AgentBinding;
   getControllableBinding(bindingId: string): AgentBinding;
   getActiveBinding(agentId: string, adapter?: string): AgentBinding;
@@ -171,6 +207,22 @@ export interface SidebandStore {
   }): ClaimOperationDispatchResult;
   recordOperationReceipt(input: RecordOperationReceiptInput): OperationRecord;
   getOperation(operationId: string): OperationRecord;
+  reclaimIndeterminateDispatch(input: {
+    operationId: string;
+    dispatchOwnerId: string;
+  }): ClaimOperationDispatchResult;
+  savePreparedRequest(input: {
+    operationId: string;
+    adapter: string;
+    bindingId: string;
+    prepared: HostPreparedRequest;
+  }): StoredHostRequest;
+  getPreparedRequest(operationId: string, leg: HostDeliveryLeg): StoredHostRequest | null;
+  recordPreparedReceipt(input: {
+    operationId: string;
+    leg: HostDeliveryLeg;
+    receipt: HostOperationReceipt;
+  }): StoredHostRequest;
 
   listEvents(input: { afterSequence: number; limit: number }): readonly SidebandEvent[];
   getEventHead(): number;

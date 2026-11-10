@@ -61,17 +61,29 @@ describe("Agent Sideband HTTP API", () => {
       expect(response.statusCode).toBe(200);
     }
 
+    const payload = {
+      target: { type: "agent", id: "reviewer" },
+      correlationId: "task-1",
+      body: "Review this.",
+      messageClass: "request",
+    };
+    const spoofed = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: { ...headers, "idempotency-key": "api-send-spoof" },
+      payload: { ...payload, fromAgentId: "reviewer" },
+    });
+    expect(spoofed.statusCode).toBe(422);
+    expect(spoofed.json().error).toMatchObject({
+      code: "IDENTITY_FIELD_REJECTED",
+      details: { field: "fromAgentId" },
+    });
+
     const sent = await app.inject({
       method: "POST",
       url: "/v1/messages",
       headers: { ...headers, "idempotency-key": "api-send-1" },
-      payload: {
-        fromAgentId: "reviewer",
-        target: { type: "agent", id: "reviewer" },
-        correlationId: "task-1",
-        body: "Review this.",
-        messageClass: "request",
-      },
+      payload,
     });
     expect(sent.statusCode).toBe(201);
     expect(sent.json()).toEqual(
@@ -174,7 +186,7 @@ describe("Agent Sideband HTTP API", () => {
     ).toEqual(expect.objectContaining({ actorPrincipalId: "lead-principal" }));
   });
 
-  it("derives self-service claim and acknowledgement identity from the credential", async () => {
+  it("derives self-service claim and acknowledgement identity only from the credential", async () => {
     const { app, store } = setup();
     store.registerAgent({ agentId: "lead" });
     store.registerAgent({ agentId: "sender" });
@@ -195,11 +207,20 @@ describe("Agent Sideband HTTP API", () => {
     });
     const headers = { authorization: `Bearer ${token}` };
 
-    const claimed = await app.inject({
+    const spoofedClaim = await app.inject({
       method: "POST",
       url: `/v1/inbox/${message.messageId}/claim`,
       headers,
       payload: { consumerId: "lead-worker", leaseSeconds: 30, recipientAgentId: "sender" },
+    });
+    expect(spoofedClaim.statusCode).toBe(422);
+    expect(spoofedClaim.json().error.code).toBe("IDENTITY_FIELD_REJECTED");
+
+    const claimed = await app.inject({
+      method: "POST",
+      url: `/v1/inbox/${message.messageId}/claim`,
+      headers,
+      payload: { consumerId: "lead-worker", leaseSeconds: 30 },
     });
     expect(claimed.statusCode).toBe(200);
     expect(claimed.json()).toEqual(
@@ -213,7 +234,6 @@ describe("Agent Sideband HTTP API", () => {
       payload: {
         claimToken: claimed.json().claimToken,
         receiptId: "self-service-receipt",
-        recipientAgentId: "sender",
       },
     });
     expect(acknowledged.statusCode).toBe(200);
@@ -252,7 +272,7 @@ describe("Agent Sideband HTTP API", () => {
       method: "POST",
       url: `/v1/inbox/${message.messageId}/release`,
       headers,
-      payload: { claimToken: claimed.json().claimToken, recipientAgentId: "sender" },
+      payload: { claimToken: claimed.json().claimToken },
     });
 
     expect(released.statusCode).toBe(200);

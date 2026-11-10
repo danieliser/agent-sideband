@@ -4,7 +4,11 @@ import { chmodSync, readFileSync } from "node:fs";
 import Database from "better-sqlite3";
 
 import { SidebandError } from "../core/errors.js";
-import type { HostOperationReceipt } from "../core/host-adapter.js";
+import type {
+  HostDeliveryLeg,
+  HostOperationReceipt,
+  HostPreparedRequest,
+} from "../core/host-adapter.js";
 import type {
   AgentBinding,
   AgentRecord,
@@ -26,9 +30,11 @@ import type {
   BeginOperationResult,
   BindAgentInput,
   ClaimOperationDispatchResult,
+  RawBindTarget,
   RecordOperationReceiptInput,
   SendMessageInput,
   SidebandStore,
+  StoredHostRequest,
 } from "./store.js";
 
 const MAX_PAGE_SIZE = 1_000;
@@ -37,6 +43,37 @@ const MAX_BODY_BYTES = 256 * 1_024;
 const MAX_METADATA_BYTES = 64 * 1_024;
 const MAX_LEASE_SECONDS = 300;
 const MAX_JSON_DEPTH = 16;
+
+const MAX_PREPARED_REQUEST_BYTES = 512 * 1_024;
+
+export interface SchemaMigration {
+  readonly version: number;
+  readonly name: string;
+  readonly sql: string;
+}
+
+export interface AppliedMigration {
+  readonly version: number;
+  readonly name: string;
+  readonly checksum: string;
+  readonly appliedAt: string;
+}
+
+function loadMigration(version: number, name: string, file: string): SchemaMigration {
+  return {
+    version,
+    name,
+    sql: readFileSync(new URL(`../../migrations/${file}`, import.meta.url), "utf8"),
+  };
+}
+
+/** Core schema owned by this store, applied in order through the schema_migrations ledger. */
+export function coreMigrations(): readonly SchemaMigration[] {
+  return [
+    loadMigration(1, "initial", "0001_initial.sql"),
+    loadMigration(2, "schedules", "0002_schedules.sql"),
+  ];
+}
 
 export interface SqliteSidebandStoreOptions {
   readonly now?: () => string | Date;
@@ -180,7 +217,14 @@ function hasControlCharacters(value: string): boolean {
   });
 }
 
-function validateIdentifier(value: string, name: string): string {
+/** Reason carried by the raw-bind guard so callers can tell it from other binding conflicts. */
+export const RAW_BIND_REFUSED = "RAW_BIND_REFUSED";
+
+function rawBindRefused(message: string): SidebandError {
+  return new SidebandError("BINDING_CONFLICT", message, { reason: RAW_BIND_REFUSED });
+}
+
+export function validateIdentifier(value: string, name: string): string {
   if (
     value.length === 0 ||
     value.length > 128 ||
@@ -195,7 +239,7 @@ function validateIdentifier(value: string, name: string): string {
   return value;
 }
 
-function validateText(value: string, name: string, maxBytes: number): string {
+export function validateText(value: string, name: string, maxBytes: number): string {
   if (value.length === 0 || Buffer.byteLength(value, "utf8") > maxBytes || value.includes("\0")) {
     fail(
       "INVALID_ARGUMENT",
@@ -244,7 +288,7 @@ function canonicalize(value: unknown, depth = 0, seen = new WeakSet<object>()): 
   fail("INVALID_ARGUMENT", "Value must be JSON serializable.");
 }
 
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
   return JSON.stringify(canonicalize(value));
 }
 
@@ -252,7 +296,7 @@ function parseObject(json: string): Readonly<Record<string, unknown>> {
   return JSON.parse(json) as Readonly<Record<string, unknown>>;
 }
 
-function sha256(value: string): string {
+export function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
@@ -346,9 +390,40 @@ function operationFromRow(row: OperationRow): OperationRecord {
   };
 }
 
+interface PreparedRequestRow {
+  operation_id: string;
+  leg: HostDeliveryLeg;
+  adapter: string;
+  binding_id: string;
+  protocol_version: number;
+  request_json: string;
+  request_hash: string;
+  replay_safe: number;
+  receipt_json: string | null;
+}
+
+function preparedFromRow(row: PreparedRequestRow): StoredHostRequest {
+  return {
+    operationId: row.operation_id,
+    adapter: row.adapter,
+    bindingId: row.binding_id,
+    requestHash: row.request_hash,
+    prepared: {
+      protocolVersion: 1,
+      leg: row.leg,
+      payload: parseObject(row.request_json),
+      replaySafe: row.replay_safe === 1,
+    },
+    receipt:
+      row.receipt_json === null ? null : (JSON.parse(row.receipt_json) as HostOperationReceipt),
+  };
+}
+
 export class SqliteSidebandStore implements SidebandStore {
+  private readonly knownTables = new Set<string>();
+
   private constructor(
-    private readonly database: Database.Database,
+    readonly database: Database.Database,
     private readonly options: Required<SqliteSidebandStoreOptions>,
   ) {}
 
@@ -357,11 +432,6 @@ export class SqliteSidebandStore implements SidebandStore {
     database.pragma("foreign_keys = ON");
     database.pragma("busy_timeout = 5000");
     if (path !== ":memory:") database.pragma("journal_mode = WAL");
-    const migration = readFileSync(
-      new URL("../../migrations/0001_initial.sql", import.meta.url),
-      "utf8",
-    );
-    database.exec(migration);
     if (path !== ":memory:") {
       try {
         chmodSync(path, 0o600);
@@ -381,8 +451,94 @@ export class SqliteSidebandStore implements SidebandStore {
       idleSeconds,
       tokenBytes: options.tokenBytes ?? ((size) => randomBytes(size)),
     });
+    try {
+      store.applyMigrations(coreMigrations());
+    } catch (error) {
+      database.close();
+      throw error;
+    }
     store.recoverInterruptedDispatches();
     return store;
+  }
+
+  /**
+   * Applies each migration at most once, in version order, recording a checksum in
+   * schema_migrations. An applied version whose SQL changed is a conflict, never a re-run.
+   */
+  applyMigrations(migrations: readonly SchemaMigration[]): readonly AppliedMigration[] {
+    this.database.exec(
+      `CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      )`,
+    );
+    const ordered = [...migrations].sort((left, right) => left.version - right.version);
+    for (const [index, migration] of ordered.entries()) {
+      if (!Number.isSafeInteger(migration.version) || migration.version < 1) {
+        fail("INVALID_ARGUMENT", "Migration version must be a positive integer.");
+      }
+      if (index > 0 && ordered[index - 1]?.version === migration.version) {
+        fail("INVALID_ARGUMENT", `Duplicate migration version ${migration.version}.`);
+      }
+    }
+    for (const migration of ordered) {
+      const checksum = sha256(migration.sql);
+      this.database
+        .transaction(() => {
+          const applied = this.database
+            .prepare("SELECT checksum FROM schema_migrations WHERE version = ?")
+            .get(migration.version) as { checksum: string } | undefined;
+          if (applied) {
+            if (applied.checksum !== checksum) {
+              fail(
+                "MIGRATION_CONFLICT",
+                `Migration ${migration.version} (${migration.name}) changed after it was applied.`,
+              );
+            }
+            return;
+          }
+          this.assertNoUnledgeredSchedules(migration.version);
+          this.database.exec(migration.sql);
+          this.database
+            .prepare(
+              "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+            )
+            .run(migration.version, migration.name, checksum, this.now());
+        })
+        .immediate();
+    }
+    return this.appliedMigrations();
+  }
+
+  appliedMigrations(): readonly AppliedMigration[] {
+    return (
+      this.database
+        .prepare(
+          "SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version",
+        )
+        .all() as Array<{ version: number; name: string; checksum: string; applied_at: string }>
+    ).map((row) => ({
+      version: row.version,
+      name: row.name,
+      checksum: row.checksum,
+      appliedAt: row.applied_at,
+    }));
+  }
+
+  /** Pre-ledger builds created schedule tables blindly; refuse to silently keep that shape. */
+  private assertNoUnledgeredSchedules(version: number): void {
+    if (version !== 2) return;
+    const columns = this.database.prepare("PRAGMA table_info(schedules)").all() as Array<{
+      name: string;
+    }>;
+    if (columns.length > 0 && !columns.some((column) => column.name === "grant_epoch")) {
+      fail(
+        "MIGRATION_CONFLICT",
+        "The schedules table predates the migration ledger; migrate or recreate it explicitly.",
+      );
+    }
   }
 
   private now(): string {
@@ -393,7 +549,7 @@ export class SqliteSidebandStore implements SidebandStore {
     return date.toISOString();
   }
 
-  private appendEvent(input: {
+  appendEvent(input: {
     type: string;
     entityType: string;
     entityId: string;
@@ -1175,15 +1331,64 @@ export class SqliteSidebandStore implements SidebandStore {
     return deliveryFromRow(this.deliveryRow(messageId, recipientAgentId));
   }
 
-  bindAgent(input: BindAgentInput): AgentBinding {
-    return this.database.transaction(() => this.bindAgentInTransaction(input))();
+  inTransaction<T>(fn: () => T): T {
+    return this.database.transaction(fn).immediate();
   }
 
-  private bindAgentInTransaction(input: BindAgentInput): AgentBinding {
+  bindAgent(input: BindAgentInput): AgentBinding {
+    return this.database.transaction(() => this.bindAgentInTransaction(input, false))();
+  }
+
+  /**
+   * Bind for the identity service only: it owns the managed session of the tuple, so it is the one
+   * writer allowed past the raw-bind guard. Deliberately absent from the SidebandStore interface.
+   */
+  bindManagedAgent(input: BindAgentInput): AgentBinding {
+    return this.database.transaction(() => this.bindAgentInTransaction(input, true))();
+  }
+
+  assertRawBindAllowed(target: RawBindTarget): void {
+    if (this.tupleRowExists("identity_host_sessions", target)) {
+      throw rawBindRefused(
+        "The host tuple belongs to an enrolled identity session; it binds only through enrollment.",
+      );
+    }
+    if (this.tupleRowExists("identity_spawn_intents", target)) {
+      throw rawBindRefused(
+        "The host tuple is reserved by a spawn intent; it binds only through enrollment.",
+      );
+    }
+  }
+
+  private tupleRowExists(
+    table: "identity_host_sessions" | "identity_spawn_intents",
+    target: RawBindTarget,
+  ): boolean {
+    if (!this.tableExists(table)) return false;
+    return (
+      this.database
+        .prepare(
+          `SELECT 1 FROM ${table} WHERE adapter = ? AND host_instance_id = ? AND external_id = ?`,
+        )
+        .get(target.adapter, target.hostInstanceId, target.externalId) !== undefined
+    );
+  }
+
+  private tableExists(name: string): boolean {
+    if (this.knownTables.has(name)) return true;
+    const found = this.database
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(name);
+    if (found) this.knownTables.add(name);
+    return found !== undefined;
+  }
+
+  private bindAgentInTransaction(input: BindAgentInput, managed: boolean): AgentBinding {
     this.getAgent(input.agentId);
     validateIdentifier(input.adapter, "adapter");
     validateIdentifier(input.hostInstanceId, "hostInstanceId");
     validateIdentifier(input.externalId, "externalId");
+    if (!managed) this.assertRawBindAllowed(input);
     const metadataJson = canonicalJson(input.metadata ?? {});
     const capabilitiesJson = canonicalJson(input.capabilities ?? {});
     const active = input.active ?? true;
@@ -1491,8 +1696,13 @@ export class SqliteSidebandStore implements SidebandStore {
           `Invalid operation transition ${current.stage} -> ${input.receipt.stage}.`,
         );
       }
-      const detail = input.receipt.detail ?? {};
       const failure = input.receipt.stage === "failed" || input.receipt.stage === "indeterminate";
+      // Only a definitive failure can be a retryable no-effect; never an indeterminate one.
+      const retryable =
+        input.receipt.stage === "failed" && input.receipt.retryable === true
+          ? { retryable: true }
+          : {};
+      const detail = { ...(input.receipt.detail ?? {}), ...retryable };
       const now = this.now();
       this.database
         .prepare(
@@ -1508,7 +1718,18 @@ export class SqliteSidebandStore implements SidebandStore {
           now,
           input.operationId,
         );
-      const binding = input.binding ? this.bindAgentInTransaction(input.binding) : null;
+      if (input.binding && input.bindingId !== undefined) {
+        fail("INVALID_ARGUMENT", "Pass either binding or bindingId, not both.");
+      }
+      let binding: AgentBinding | null = null;
+      if (input.binding) {
+        binding = this.bindAgentInTransaction(input.binding, false);
+      } else if (input.bindingId !== undefined) {
+        binding = this.getBinding(input.bindingId);
+        if (binding.agentId !== current.agentId) {
+          fail("BINDING_CONFLICT", "The binding belongs to a different agent than the operation.");
+        }
+      }
       if (binding) {
         this.database
           .prepare("UPDATE operations SET binding_id = ? WHERE operation_id = ?")
@@ -1538,6 +1759,131 @@ export class SqliteSidebandStore implements SidebandStore {
       return ["accepted", "adopted", "observed", "failed", "indeterminate"].includes(to);
     if (from === "adopted") return ["adopted", "observed", "failed", "indeterminate"].includes(to);
     return from === to;
+  }
+
+  /** Moves an indeterminate operation back to dispatching for an explicit, replay-safe resend. */
+  reclaimIndeterminateDispatch(input: {
+    operationId: string;
+    dispatchOwnerId: string;
+  }): ClaimOperationDispatchResult {
+    validateIdentifier(input.dispatchOwnerId, "dispatchOwnerId");
+    return this.database
+      .transaction(() => {
+        const current = this.getOperation(input.operationId);
+        if (current.stage !== "indeterminate") return { operation: current, acquired: false };
+        const now = this.now();
+        this.database
+          .prepare(
+            `UPDATE operations SET stage = 'dispatching', dispatch_owner_id = ?,
+             dispatch_started_at = ?, updated_at = ?
+           WHERE operation_id = ? AND stage = 'indeterminate'`,
+          )
+          .run(input.dispatchOwnerId, now, now, input.operationId);
+        this.appendEvent({
+          type: "operation.replaying",
+          entityType: "operation",
+          entityId: input.operationId,
+          actorPrincipalId: current.principalId,
+          ...(current.correlationId === null ? {} : { correlationId: current.correlationId }),
+          payload: { dispatchOwnerId: input.dispatchOwnerId, priorStage: "indeterminate" },
+          occurredAt: now,
+        });
+        return { operation: this.getOperation(input.operationId), acquired: true };
+      })
+      .immediate();
+  }
+
+  savePreparedRequest(input: {
+    operationId: string;
+    adapter: string;
+    bindingId: string;
+    prepared: HostPreparedRequest;
+  }): StoredHostRequest {
+    const { prepared } = input;
+    if (prepared.protocolVersion !== 1 || !["wake", "context"].includes(prepared.leg)) {
+      fail("INVALID_ARGUMENT", "Prepared host request has an unsupported shape.");
+    }
+    const requestJson = canonicalJson(prepared.payload);
+    if (Buffer.byteLength(requestJson, "utf8") > MAX_PREPARED_REQUEST_BYTES) {
+      fail("INVALID_ARGUMENT", "Prepared host request is too large.");
+    }
+    const requestHash = sha256(
+      canonicalJson({
+        leg: prepared.leg,
+        payload: prepared.payload,
+        replaySafe: prepared.replaySafe,
+      }),
+    );
+    return this.database
+      .transaction(() => {
+        const operation = this.getOperation(input.operationId);
+        const existing = this.getPreparedRequest(input.operationId, prepared.leg);
+        if (existing) {
+          if (existing.requestHash !== requestHash || existing.bindingId !== input.bindingId) {
+            fail(
+              "IDEMPOTENCY_CONFLICT",
+              `Operation ${input.operationId} already prepared a different ${prepared.leg} request.`,
+            );
+          }
+          return existing;
+        }
+        if (operation.stage !== "dispatching") {
+          fail("INVALID_ARGUMENT", "Host requests are prepared only by the dispatch owner.");
+        }
+        const now = this.now();
+        this.database
+          .prepare(
+            `INSERT INTO host_prepared_requests (
+            operation_id, leg, adapter, binding_id, protocol_version, request_json, request_hash,
+            replay_safe, receipt_stage, receipt_id, receipt_json, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, NULL, NULL, ?, ?)`,
+          )
+          .run(
+            input.operationId,
+            prepared.leg,
+            input.adapter,
+            input.bindingId,
+            requestJson,
+            requestHash,
+            prepared.replaySafe ? 1 : 0,
+            now,
+            now,
+          );
+        return this.getPreparedRequest(input.operationId, prepared.leg) as StoredHostRequest;
+      })
+      .immediate();
+  }
+
+  getPreparedRequest(operationId: string, leg: HostDeliveryLeg): StoredHostRequest | null {
+    const row = this.database
+      .prepare("SELECT * FROM host_prepared_requests WHERE operation_id = ? AND leg = ?")
+      .get(operationId, leg) as PreparedRequestRow | undefined;
+    return row ? preparedFromRow(row) : null;
+  }
+
+  recordPreparedReceipt(input: {
+    operationId: string;
+    leg: HostDeliveryLeg;
+    receipt: HostOperationReceipt;
+  }): StoredHostRequest {
+    return this.database.transaction(() => {
+      const existing = this.getPreparedRequest(input.operationId, input.leg);
+      if (!existing) fail("OPERATION_NOT_FOUND", "No prepared request for this operation leg.");
+      this.database
+        .prepare(
+          `UPDATE host_prepared_requests SET receipt_stage = ?, receipt_id = ?, receipt_json = ?,
+             updated_at = ? WHERE operation_id = ? AND leg = ?`,
+        )
+        .run(
+          input.receipt.stage,
+          input.receipt.receiptId,
+          canonicalJson(input.receipt),
+          this.now(),
+          input.operationId,
+          input.leg,
+        );
+      return this.getPreparedRequest(input.operationId, input.leg) as StoredHostRequest;
+    })();
   }
 
   getOperation(operationId: string): OperationRecord {

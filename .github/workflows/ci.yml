@@ -27,4 +27,10 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
-      - run: npm pack --dry-run
+      - name: Qualify installed release artifact
+        run: |
+          mkdir -p .qualification/consumer .qualification/runtime
+          npm pack --pack-destination .qualification
+          printf '%s\n' '{"private":true,"type":"module"}' > .qualification/consumer/package.json
+          npm install --prefix .qualification/consumer --no-audit --no-fund "$PWD/.qualification/agent-sideband-$(node -p "require('./package.json').version").tgz"
+          TMPDIR="$PWD/.qualification/runtime" node --import tsx scripts/qualify-scheduler.ts "$PWD/.qualification/consumer/node_modules/agent-sideband"

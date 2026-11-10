@@ -5,15 +5,27 @@ import type {
   HostAdapter,
   HostAdapterCapabilities,
   HostBindingProof,
+  HostDeliveryLeg,
   HostOperationReceipt,
+  HostPreparedRequest,
+  HostPrepareFailure,
+  HostSendRequest,
+  HostSpawnPlan,
   HostSpawnReceipt,
 } from "./host-adapter.js";
+import type { SpawnIdentityCoordinator } from "./spawn-identity.js";
 import type { AgentBinding, MessageRecord, OperationRecord } from "./types.js";
-import type { SidebandStore } from "../store/store.js";
+import { RAW_BIND_REFUSED } from "../store/sqlite.js";
+import type { RecordOperationReceiptInput, SidebandStore } from "../store/store.js";
 
 export interface AgentSidebandOptions {
   readonly store: SidebandStore;
   readonly adapters: readonly HostAdapter[];
+  /**
+   * Opts spawns on adapters that implement planSpawn into managed identity: the host tuple is
+   * reserved as an authorized intent before any host I/O. Without it every spawn is unmanaged.
+   */
+  readonly spawnIdentity?: SpawnIdentityCoordinator;
 }
 
 export interface HostOperationResult {
@@ -30,6 +42,13 @@ export interface SpawnAgentInput {
   readonly prompt: string;
   readonly provider: string;
   readonly metadata: Readonly<Record<string, unknown>>;
+  /**
+   * Managed spawns only: the trusted spawner handle (an operator principal or a verified agent
+   * credential) that trusted server code obtained from authentication. Never request input.
+   * Provenance and authority derive from it; `principalId` and `parentAgentId` are only checked
+   * against it.
+   */
+  readonly spawner?: unknown;
 }
 
 export interface BindAgentInput {
@@ -50,6 +69,48 @@ export interface SendMessageToHostInput {
   readonly bindingId: string;
   readonly messageId: string;
   readonly mode: "wake" | "context" | "both";
+  /**
+   * Explicitly resend an indeterminate operation's stored requests. Allowed only when every
+   * unfinished leg was prepared replay-safe by the adapter; otherwise HOST_OUTCOME_INDETERMINATE.
+   */
+  readonly replayIndeterminate?: boolean;
+}
+
+type FailureReceipt = Extract<HostOperationReceipt, { readonly stage: "failed" | "indeterminate" }>;
+
+const isFailure = (receipt: HostOperationReceipt): receipt is FailureReceipt =>
+  receipt.stage === "failed" || receipt.stage === "indeterminate";
+
+const legsFor = (mode: "wake" | "context" | "both"): readonly HostDeliveryLeg[] =>
+  mode === "wake" ? ["wake"] : mode === "context" ? ["context"] : ["context", "wake"];
+
+/**
+ * A failed replay proves nothing about the first attempt, which may already have taken effect.
+ * The outcome stays unknown, and no retry hint survives to invite a new operation.
+ */
+function replayUnknown(failure: FailureReceipt): FailureReceipt {
+  if (failure.stage === "indeterminate") return failure;
+  const detail: Record<string, unknown> = { ...failure.detail };
+  delete detail.retryable;
+  return {
+    stage: "indeterminate",
+    receiptId: failure.receiptId,
+    errorCode: failure.errorCode,
+    errorMessage: failure.errorMessage,
+    detail: { ...detail, replayFailed: true },
+  };
+}
+
+/** A later leg failing after an earlier leg took effect must not be retried as a fresh operation. */
+function partialFailure(receipt: FailureReceipt, contextReceiptId: string | null): FailureReceipt {
+  if (contextReceiptId === null) return receipt;
+  return {
+    stage: receipt.stage,
+    receiptId: receipt.receiptId,
+    errorCode: receipt.errorCode,
+    errorMessage: receipt.errorMessage,
+    detail: { ...receipt.detail, contextReceiptId },
+  };
 }
 
 export class AgentSideband {
@@ -64,10 +125,14 @@ export class AgentSideband {
     }
   }
 
-  private adapter(name: string): HostAdapter {
+  hostAdapter(name: string): HostAdapter {
     const adapter = this.adapters.get(name);
     if (!adapter) throw new SidebandError("ADAPTER_NOT_FOUND", `Host adapter not found: ${name}`);
     return adapter;
+  }
+
+  private adapter(name: string): HostAdapter {
+    return this.hostAdapter(name);
   }
 
   private async requireCapability(
@@ -96,7 +161,204 @@ export class AgentSideband {
     };
   }
 
+  /** True when spawns on this adapter reserve their host tuple as a managed identity intent. */
+  managesSpawnIdentity(adapterName: string): boolean {
+    return this.managedSpawnAdapter(adapterName) !== null;
+  }
+
+  private managedSpawnAdapter(adapterName: string): HostAdapter | null {
+    const adapter = this.adapters.get(adapterName);
+    return this.options.spawnIdentity !== undefined && adapter?.planSpawn !== undefined
+      ? adapter
+      : null;
+  }
+
+  private refuseSpawner(reason: string, message: string): never {
+    throw new SidebandError("UNAUTHORIZED", message, { reason });
+  }
+
+  /**
+   * Managed spawn. Order matters: verify the trusted spawner (no writes), begin the operation,
+   * plan the tuple, then claim the dispatch and reserve the authorized intent in ONE transaction.
+   * Only after that commits does the adapter touch the host. The receipt and, after a definite
+   * failure, the abandon commit together. The binding comes from identity enrollment, never from
+   * a raw bind here.
+   */
+  private async spawnManaged(
+    input: SpawnAgentInput,
+    adapter: HostAdapter,
+    coordinator: SpawnIdentityCoordinator,
+  ): Promise<HostOperationResult> {
+    if (input.spawner === undefined) {
+      this.refuseSpawner("SPAWNER_REQUIRED", "Managed spawns require a trusted spawner.");
+    }
+    const authority = coordinator.verifySpawner(input.spawner);
+    if (input.principalId !== undefined && input.principalId !== authority.principalId) {
+      this.refuseSpawner("PRINCIPAL_MISMATCH", "The principal differs from the verified spawner.");
+    }
+    if (input.parentAgentId !== authority.agentId) {
+      this.refuseSpawner("PARENT_MISMATCH", "The parent differs from the verified spawner.");
+    }
+    for (const key of adapter.reservedSpawnMetadata ?? []) {
+      if (key in input.metadata) {
+        throw new SidebandError(
+          "INVALID_ARGUMENT",
+          `Spawn metadata '${key}' is chosen by Sideband and cannot be set by the caller.`,
+        );
+      }
+    }
+    const principalId = authority.principalId;
+    try {
+      this.options.store.getAgent(input.agentId);
+    } catch (error) {
+      if (!(error instanceof SidebandError) || error.code !== "AGENT_NOT_FOUND") throw error;
+      this.options.store.registerAgent({ agentId: input.agentId, actorPrincipalId: principalId });
+    }
+    const request = {
+      agentId: input.agentId,
+      adapter: input.adapter,
+      parentAgentId: authority.agentId,
+      prompt: input.prompt,
+      provider: input.provider,
+      metadata: input.metadata,
+    };
+    const begun = this.options.store.beginOperation({
+      principalId,
+      idempotencyKey: input.idempotencyKey,
+      kind: "spawn",
+      adapter: input.adapter,
+      agentId: input.agentId,
+      request,
+    });
+    // A replay re-verified the spawner above, so a revoked caller cannot read an old outcome back.
+    if (begun.operation.stage !== "queued") {
+      return {
+        operation: begun.operation,
+        binding: this.bindingForCompletedOperation(begun.operation),
+      };
+    }
+    await this.requireCapability(adapter, "spawn");
+    const operationId = begun.operation.operationId;
+    let plan: HostSpawnPlan;
+    try {
+      plan = await (adapter.planSpawn as NonNullable<HostAdapter["planSpawn"]>)({
+        operationId,
+        agentId: input.agentId,
+        provider: input.provider,
+        metadata: input.metadata,
+      });
+    } catch {
+      throw new SidebandError(
+        "ADAPTER_CAPABILITY_UNAVAILABLE",
+        `Adapter ${adapter.name} could not plan the spawn; nothing was sent.`,
+      );
+    }
+    const tuple = { adapter: input.adapter, ...plan };
+    const dispatch = this.options.store.inTransaction(() => {
+      const claimed = this.options.store.claimOperationDispatch({
+        operationId,
+        dispatchOwnerId: randomUUID(),
+      });
+      if (claimed.acquired) {
+        coordinator.reserve(input.spawner, {
+          spawnOperationId: operationId,
+          ...tuple,
+          intendedAgentId: input.agentId,
+        });
+      }
+      return claimed;
+    });
+    if (!dispatch.acquired) {
+      return {
+        operation: dispatch.operation,
+        binding: this.bindingForCompletedOperation(dispatch.operation),
+      };
+    }
+    let receipt: HostSpawnReceipt;
+    try {
+      receipt = await adapter.spawn({
+        ...request,
+        idempotencyKey: input.idempotencyKey,
+        operationId,
+        plan: { hostInstanceId: plan.hostInstanceId, externalId: plan.externalId },
+      });
+    } catch {
+      receipt = this.indeterminate();
+    }
+    receipt = this.requirePlannedTuple(receipt, plan);
+    const operation = this.options.store.inTransaction(() => {
+      const succeeded =
+        receipt.stage === "accepted" || receipt.stage === "adopted" || receipt.stage === "observed";
+      // Enrollment may already have created the managed binding while the host call was in flight.
+      const bindingId = succeeded ? coordinator.managedBindingId(tuple, input.agentId) : null;
+      const recorded = this.options.store.recordOperationReceipt({
+        operationId,
+        receipt,
+        ...(bindingId === null ? {} : { bindingId }),
+      });
+      // Only a definite failure releases the intent; unknown outcomes keep the tuple reserved.
+      if (receipt.stage === "failed") {
+        coordinator.abandon(operationId, `${receipt.errorCode}: ${receipt.errorMessage}`);
+      }
+      return recorded;
+    });
+    return { operation, binding: this.bindingForCompletedOperation(operation) };
+  }
+
+  /** A host that reports a tuple other than the reserved one acted somewhere unplanned. */
+  private requirePlannedTuple(receipt: HostSpawnReceipt, plan: HostSpawnPlan): HostSpawnReceipt {
+    if (!("externalId" in receipt)) return receipt;
+    if (receipt.hostInstanceId === plan.hostInstanceId && receipt.externalId === plan.externalId) {
+      return receipt;
+    }
+    return {
+      stage: "indeterminate",
+      receiptId: receipt.receiptId,
+      errorCode: "SPAWN_TUPLE_MISMATCH",
+      errorMessage: "The host reported a different thread than the one Sideband reserved.",
+      detail: {
+        plannedHostInstanceId: plan.hostInstanceId,
+        plannedExternalId: plan.externalId,
+        reportedHostInstanceId: receipt.hostInstanceId,
+        reportedExternalId: receipt.externalId,
+      },
+    };
+  }
+
+  /**
+   * Records a receipt that carries a raw binding. If the tuple belongs to identity enrollment the
+   * raw-bind guard refuses it; the host did act, so the outcome stays unknown instead of
+   * stranding the operation mid-dispatch.
+   */
+  private recordReceiptWithBinding(input: RecordOperationReceiptInput): OperationRecord {
+    try {
+      return this.options.store.recordOperationReceipt(input);
+    } catch (error) {
+      if (
+        input.binding === undefined ||
+        !(error instanceof SidebandError) ||
+        error.code !== "BINDING_CONFLICT" ||
+        error.details.reason !== RAW_BIND_REFUSED
+      ) {
+        throw error;
+      }
+      return this.options.store.recordOperationReceipt({
+        operationId: input.operationId,
+        receipt: {
+          stage: "indeterminate",
+          receiptId: input.receipt.receiptId,
+          errorCode: "BINDING_REFUSED",
+          errorMessage: error.message,
+        },
+      });
+    }
+  }
+
   async spawnAgent(input: SpawnAgentInput): Promise<HostOperationResult> {
+    const managedAdapter = this.managedSpawnAdapter(input.adapter);
+    if (managedAdapter !== null && this.options.spawnIdentity !== undefined) {
+      return this.spawnManaged(input, managedAdapter, this.options.spawnIdentity);
+    }
     const principalId = input.principalId ?? "local-owner";
     try {
       this.options.store.getAgent(input.agentId);
@@ -167,7 +429,7 @@ export class AgentSideband {
             causationId: dispatch.operation.operationId,
           }
         : undefined;
-    const operation = this.options.store.recordOperationReceipt({
+    const operation = this.recordReceiptWithBinding({
       operationId: dispatch.operation.operationId,
       receipt,
       ...(bindingInput === undefined ? {} : { binding: bindingInput }),
@@ -203,6 +465,13 @@ export class AgentSideband {
         binding: this.bindingForCompletedOperation(begun.operation),
       };
     }
+    // Refuse a tuple that identity enrollment manages before the host is touched.
+    this.options.store.assertRawBindAllowed({
+      agentId: input.agentId,
+      adapter: input.adapter,
+      hostInstanceId: input.hostInstanceId,
+      externalId: input.externalId,
+    });
     const adapter = this.adapter(input.adapter);
     const capabilities = await this.requireCapability(adapter, "bind");
     const dispatch = this.options.store.claimOperationDispatch({
@@ -244,7 +513,7 @@ export class AgentSideband {
             causationId: dispatch.operation.operationId,
           }
         : undefined;
-    const operation = this.options.store.recordOperationReceipt({
+    const operation = this.recordReceiptWithBinding({
       operationId: dispatch.operation.operationId,
       receipt,
       ...(bindingInput === undefined ? {} : { binding: bindingInput }),
@@ -261,6 +530,30 @@ export class AgentSideband {
       messageId: message.messageId,
       mode: input.mode,
     };
+    const replayed = this.options.store.findOperationByIdempotency({
+      principalId,
+      idempotencyKey: input.idempotencyKey,
+      kind: "send",
+      request,
+    });
+    if (replayed !== null) {
+      if (input.replayIndeterminate && replayed.stage === "indeterminate") {
+        return this.replayIndeterminate(replayed, input.mode);
+      }
+      return { operation: replayed, binding };
+    }
+    const controllableBinding = this.options.store.getControllableBinding(input.bindingId);
+    const adapter = this.adapter(controllableBinding.adapter);
+    const capabilities = await adapter.capabilities();
+    if ((input.mode === "wake" || input.mode === "both") && !capabilities.wake) {
+      throw new SidebandError("ADAPTER_CAPABILITY_UNAVAILABLE", "Adapter cannot wake an agent.");
+    }
+    if ((input.mode === "context" || input.mode === "both") && !capabilities.context) {
+      throw new SidebandError("ADAPTER_CAPABILITY_UNAVAILABLE", "Adapter cannot inject context.");
+    }
+    if (!message.recipientAgentIds.includes(controllableBinding.agentId)) {
+      throw new SidebandError("UNAUTHORIZED", "Binding does not belong to a message recipient.");
+    }
     const begun = this.options.store.beginOperation({
       principalId,
       idempotencyKey: input.idempotencyKey,
@@ -275,18 +568,6 @@ export class AgentSideband {
     if (begun.operation.stage !== "queued") {
       return { operation: begun.operation, binding };
     }
-    const controllableBinding = this.options.store.getControllableBinding(input.bindingId);
-    const adapter = this.adapter(controllableBinding.adapter);
-    const capabilities = await adapter.capabilities();
-    if ((input.mode === "wake" || input.mode === "both") && !capabilities.wake) {
-      throw new SidebandError("ADAPTER_CAPABILITY_UNAVAILABLE", "Adapter cannot wake an agent.");
-    }
-    if ((input.mode === "context" || input.mode === "both") && !capabilities.context) {
-      throw new SidebandError("ADAPTER_CAPABILITY_UNAVAILABLE", "Adapter cannot inject context.");
-    }
-    if (!message.recipientAgentIds.includes(controllableBinding.agentId)) {
-      throw new SidebandError("UNAUTHORIZED", "Binding does not belong to a message recipient.");
-    }
     const dispatch = this.options.store.claimOperationDispatch({
       operationId: begun.operation.operationId,
       dispatchOwnerId: randomUUID(),
@@ -296,18 +577,21 @@ export class AgentSideband {
     }
     let receipt: HostOperationReceipt;
     try {
-      receipt = await adapter.send({
-        idempotencyKey: input.idempotencyKey,
-        operationId: dispatch.operation.operationId,
-        binding: controllableBinding,
-        messageId: message.messageId,
-        fromAgentId: message.fromAgentId,
-        correlationId: message.correlationId,
-        body: message.body,
-        messageClass: message.messageClass,
-        metadata: message.metadata,
-        mode: input.mode,
-      });
+      receipt = await this.deliver(
+        adapter,
+        {
+          idempotencyKey: input.idempotencyKey,
+          operationId: dispatch.operation.operationId,
+          binding: controllableBinding,
+          messageId: message.messageId,
+          fromAgentId: message.fromAgentId,
+          correlationId: message.correlationId,
+          body: message.body,
+          messageClass: message.messageClass,
+          metadata: message.metadata,
+        },
+        input.mode,
+      );
     } catch {
       receipt = this.indeterminate();
     }
@@ -316,6 +600,157 @@ export class AgentSideband {
       receipt,
     });
     return { operation: completedOperation, binding };
+  }
+
+  /**
+   * Adapters with prepare/execute get each leg persisted before I/O. Adapters with injectContext
+   * get a separate context leg that must succeed before any wake. Others keep send(mode).
+   */
+  private async deliver(
+    adapter: HostAdapter,
+    request: Omit<HostSendRequest, "mode">,
+    mode: "wake" | "context" | "both",
+  ): Promise<HostOperationReceipt> {
+    if (adapter.prepare && adapter.execute) {
+      return this.deliverPrepared(adapter, request, mode);
+    }
+    if (mode === "wake" || !adapter.injectContext) {
+      return adapter.send({ ...request, mode });
+    }
+    const context = await adapter.injectContext({
+      idempotencyKey: `${request.idempotencyKey}:context`,
+      binding: request.binding,
+      messageId: request.messageId,
+      body: request.body,
+      metadata: request.metadata,
+    });
+    if (mode === "context" || context.stage === "failed" || context.stage === "indeterminate") {
+      return context;
+    }
+    const wake = await adapter.send({ ...request, mode: "wake" });
+    return isFailure(wake) ? partialFailure(wake, context.receiptId) : wake;
+  }
+
+  /**
+   * Prepares, persists, then executes each leg. A leg with a successful stored receipt is a
+   * checkpoint and never runs twice; a stored leg without one is resent byte-for-byte.
+   */
+  private async deliverPrepared(
+    adapter: HostAdapter,
+    request: Omit<HostSendRequest, "mode">,
+    mode: "wake" | "context" | "both",
+    replaying = false,
+  ): Promise<HostOperationReceipt> {
+    const prepare = adapter.prepare as NonNullable<HostAdapter["prepare"]>;
+    const execute = adapter.execute as NonNullable<HostAdapter["execute"]>;
+    let contextReceiptId: string | null = null;
+    let last: HostOperationReceipt | undefined;
+    for (const leg of legsFor(mode)) {
+      let stored = this.options.store.getPreparedRequest(request.operationId, leg);
+      if (stored?.receipt && !isFailure(stored.receipt)) {
+        last = stored.receipt;
+        if (leg === "context") contextReceiptId = stored.receipt.receiptId;
+        continue;
+      }
+      if (!stored) {
+        let prepared: HostPreparedRequest | HostPrepareFailure;
+        try {
+          prepared = await prepare.call(adapter, { ...request, leg });
+        } catch {
+          prepared = {
+            stage: "failed",
+            receiptId: null,
+            errorCode: "HOST_ADAPTER_ERROR",
+            errorMessage: "Host adapter failed while preparing the request; nothing was sent.",
+          };
+        }
+        if ("stage" in prepared) {
+          return partialFailure(replaying ? replayUnknown(prepared) : prepared, contextReceiptId);
+        }
+        stored = this.options.store.savePreparedRequest({
+          operationId: request.operationId,
+          adapter: adapter.name,
+          bindingId: request.binding.bindingId,
+          prepared,
+        });
+      }
+      let receipt: HostOperationReceipt;
+      try {
+        receipt = await execute.call(adapter, {
+          operationId: request.operationId,
+          binding: request.binding,
+          prepared: stored.prepared,
+        });
+      } catch {
+        receipt = this.indeterminate();
+      }
+      if (replaying && receipt.stage === "failed") {
+        // Keep the leg's stored (unknown) outcome so a later explicit replay can still resolve it.
+        return partialFailure(replayUnknown(receipt), contextReceiptId);
+      }
+      this.options.store.recordPreparedReceipt({ operationId: request.operationId, leg, receipt });
+      if (isFailure(receipt)) return partialFailure(receipt, contextReceiptId);
+      if (leg === "context") contextReceiptId = receipt.receiptId;
+      last = receipt;
+    }
+    return last as HostOperationReceipt;
+  }
+
+  private async replayIndeterminate(
+    operation: OperationRecord,
+    mode: "wake" | "context" | "both",
+  ): Promise<HostOperationResult> {
+    const adapter = this.adapter(operation.adapter);
+    const unsafe = (reason: string): never => {
+      throw new SidebandError(
+        "HOST_OUTCOME_INDETERMINATE",
+        `Operation ${operation.operationId} cannot be replayed safely: ${reason}`,
+        { operationId: operation.operationId },
+      );
+    };
+    if (!adapter.prepare || !adapter.execute) unsafe("the adapter has no stored-request replay.");
+    if (operation.bindingId === null || operation.messageId === null) unsafe("no stored route.");
+    for (const leg of legsFor(mode)) {
+      const stored = this.options.store.getPreparedRequest(operation.operationId, leg);
+      // A missing row means the leg was never sent: requests are persisted before any I/O.
+      if (stored && (stored.receipt === null || isFailure(stored.receipt))) {
+        if (stored.receipt?.stage === "failed") unsafe(`the ${leg} leg already failed.`);
+        if (!stored.prepared.replaySafe) unsafe(`the ${leg} leg is not replay-safe.`);
+      }
+    }
+    const binding = this.options.store.getControllableBinding(operation.bindingId as string);
+    const message = this.options.store.getMessage(operation.messageId as string);
+    const dispatch = this.options.store.reclaimIndeterminateDispatch({
+      operationId: operation.operationId,
+      dispatchOwnerId: randomUUID(),
+    });
+    if (!dispatch.acquired) return { operation: dispatch.operation, binding };
+    let receipt: HostOperationReceipt;
+    try {
+      receipt = await this.deliverPrepared(
+        adapter,
+        {
+          idempotencyKey: operation.idempotencyKey,
+          operationId: operation.operationId,
+          binding,
+          messageId: message.messageId,
+          fromAgentId: message.fromAgentId,
+          correlationId: message.correlationId,
+          body: message.body,
+          messageClass: message.messageClass,
+          metadata: message.metadata,
+        },
+        mode,
+        true,
+      );
+    } catch {
+      receipt = this.indeterminate();
+    }
+    const completed = this.options.store.recordOperationReceipt({
+      operationId: operation.operationId,
+      receipt,
+    });
+    return { operation: completed, binding };
   }
 
   /** Compatibility helper: notifies a host without claiming or acknowledging the mailbox row. */

@@ -29,7 +29,7 @@ afterEach(async () => {
 });
 
 describe("Agent Sideband MCP server", () => {
-  it("exposes the standalone coordination and lifecycle toolset", async () => {
+  it("exposes the standalone coordination, scheduling and lifecycle toolset", async () => {
     const { client } = await setup();
     const result = await client.listTools();
 
@@ -48,6 +48,14 @@ describe("Agent Sideband MCP server", () => {
         "sideband_message_release",
         "sideband_message_send",
         "sideband_presence_heartbeat",
+        "sideband_capabilities_get",
+        "sideband_identity_get",
+        "sideband_schedule_create",
+        "sideband_schedules_list",
+        "sideband_schedule_get",
+        "sideband_schedule_occurrences_list",
+        "sideband_schedule_cancel",
+        "sideband_schedule_event_emit",
       ].sort(),
     );
   });
